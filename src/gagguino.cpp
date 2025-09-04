@@ -23,12 +23,12 @@ static inline void LOG(const char* fmt, ...) {
 }
 
 namespace {
-constexpr int SPI_SLAVES = 1;
-constexpr int FLOW_PIN = 26, ZC_PIN = 25, MAX_CS = 16, HEAT_PIN = 27, AC_SENS = 14;
-constexpr int SPI_MOSI = 23, SPI_MISO = 19, SPI_SCK = 18;
-constexpr int LOAD_PIN = 35, PRESS_PIN = 36;
+constexpr int FLOW_PIN = 26, ZC_PIN = 25, HEAT_PIN = 27, AC_SENS = 14;
+constexpr int SPI_MOSI = 23, SPI_MISO = 19, SPI_SCK = 18, MAX_CS = 5;
+constexpr int PRESS_PIN = 35;
 
-constexpr unsigned long PRESS_CYCLE = 100, PID_CYCLE = 500, PWM_CYCLE = 500, SER_OUT_CYCLE = 200;
+constexpr unsigned long PRESS_CYCLE = 100, PID_CYCLE = 500, PWM_CYCLE = 500, SER_OUT_CYCLE = 200,
+                        LOG_CYCLE = 2000;
 
 // Brew & Steam setpoint limits
 constexpr float BREW_MIN = 90.0f, BREW_MAX = 99.0f;
@@ -54,7 +54,7 @@ constexpr unsigned long ZC_WAIT = 2000, ZC_OFF = 1000, SHOT_RESET = 30000;
 constexpr unsigned long AC_WAIT = 100;
 constexpr int STEAM_MIN = 20;
 
-const bool streamData = true, debugPrint = false;
+const bool streamData = true, debugPrint = true;
 }  // namespace
 
 // ---------- Devices / globals ----------
@@ -62,9 +62,6 @@ namespace {
 Adafruit_MAX31865 max31865(MAX_CS, SPI_MOSI, SPI_MISO, SPI_SCK);
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
-
-int spiSlaves[1];
-int activeSlave = -1;
 
 // Temps / PID
 float currentTemp = 0.0f, lastTemp = 0.0f;
@@ -76,15 +73,18 @@ int heatCycles = 0;
 bool heaterState = false;
 
 // Pressure
+int rawPress = 0;
 float lastPress = 0.0f, pressNow = 0.0f, pressSum = 0.0f, pressGrad = PRESS_GRAD,
       pressInt = PRESS_INT_0;
 float pressBuff[PRESS_BUFF_SIZE] = {0};
 long pressBuffIdx = 0;
 
 // Time/shot
-unsigned long nLoop = 0, currentTime = 0, lastPidTime = 0, lastPwmTime = 0, lastSerialTime = 0;
+unsigned long nLoop = 0, currentTime = 0, lastPidTime = 0, lastPwmTime = 0, lastSerialTime = 0,
+              lastLogTime = 0;
+;
 unsigned long lastPulseTime = 0, shotStart = 0, startTime = 0;
-float shotTime = 0;  // tenths
+float shotTime = 0;  //
 
 // Flow / flags
 unsigned long pulseCount = 0, zcCount = 0, lastZcTime = 0;
@@ -203,10 +203,81 @@ static float calcPID(float p, float i, float d, float sp, float pv, float& lastP
     return out;
 }
 
-static void spiSlaveSelect(int ss) {
-    if (activeSlave != ss) {
-        for (int i = 0; i < SPI_SLAVES; i++) digitalWrite(spiSlaves[i], !(ss == i));
-        activeSlave = ss;
+// --- MAX31865 deep debug read: proves the analog path ---
+static void debugReadMAX31865() {
+    // Configure for your wiring (2/3/4 wire)
+    max31865.begin(MAX31865_2WIRE);
+    delay(5);
+
+    // Clear any latched faults, enable bias, take a one-shot
+    max31865.clearFault();
+    max31865.enableBias(true);
+    delay(10);  // bias settle
+    max31865.autoConvert(false);
+    delay(1);
+
+    pinMode(MAX_CS, OUTPUT);
+    digitalWrite(MAX_CS, LOW);
+
+    uint16_t raw = max31865.readRTD();  // Library returns 15-bit value (D15..D1), LSB is fault
+    // Some forks return the unshifted word. Normalize defensively:
+    uint16_t rtd = (raw > 32768) ? (raw >> 1) : raw;
+
+    // Ratio is 15-bit / 32768.0
+    float ratio = (float)rtd / 32768.0f;
+    float R = ratio * RREF;
+
+    uint8_t f = max31865.readFault();
+    max31865.enableBias(false);
+
+    LOG("MAX31865: raw=0x%04X rtd=%u ratio=%.6f R=%.2f Ω", raw, rtd, ratio, R);
+
+    if (f) {
+        LOG("MAX31865: FAULT=0x%02X%s%s%s%s%s%s", f,
+            (f & MAX31865_FAULT_HIGHTHRESH) ? " HIGHTHRESH" : "",
+            (f & MAX31865_FAULT_LOWTHRESH) ? " LOWTHRESH" : "",
+            (f & MAX31865_FAULT_REFINLOW) ? " REFINLOW" : "",
+            (f & MAX31865_FAULT_REFINHIGH) ? " REFINHIGH" : "",
+            (f & MAX31865_FAULT_RTDINLOW) ? " RTDINLOW" : "",
+            (f & MAX31865_FAULT_OVUV) ? " OVC/UV" : "");
+        // Keep faults latched in logs; clear if you want to retry:
+        // max31865.clearFault();
+    }
+
+    // For extra confidence, also compute temperature:
+    float t = max31865.temperature(RNOMINAL, RREF);
+    LOG("MAX31865: Temp=%.2f °C (RNOM=%.1f, RREF=%.1f)", t, RNOMINAL, RREF);
+}
+
+// --- MAX31865 connectivity check & logging ---
+static void logMax31865Status() {
+    uint8_t f = max31865.readFault();
+
+    // If the chip isn't on the bus, many MCUs will read 0xFF on MISO
+    if (f == 0xFF) {
+        LOG("MAX31865: no SPI response (CS=%d SCK=%d MISO=%d MOSI=%d) — check wiring/power", MAX_CS,
+            SPI_SCK, SPI_MISO, SPI_MOSI);
+        return;
+    }
+
+    if (f) {
+        // Decode common fault bits for clarity
+        LOG("MAX31865: detected but reporting FAULT=0x%02X%s%s%s%s%s%s", f,
+            (f & MAX31865_FAULT_HIGHTHRESH) ? " HIGHTHRESH" : "",
+            (f & MAX31865_FAULT_LOWTHRESH) ? " LOWTHRESH" : "",
+            (f & MAX31865_FAULT_REFINLOW) ? " REFINLOW" : "",
+            (f & MAX31865_FAULT_REFINHIGH) ? " REFINHIGH" : "",
+            (f & MAX31865_FAULT_RTDINLOW) ? " RTDINLOW" : "",
+            (f & MAX31865_FAULT_OVUV) ? " OVC/UV" : "");
+        max31865.clearFault();
+    } else {
+        // Read raw ratio (0..1), calculate resistance, and temperature
+        float ratio = max31865.readRTD() / 32768.0f;
+        float resistance = ratio * RREF;
+        float tempC = max31865.temperature(RNOMINAL, RREF);
+
+        LOG("MAX31865: connected; RTD ratio=%.6f  R=%.2f Ω  Temp=%.2f °C", ratio, resistance,
+            tempC);
     }
 }
 
@@ -234,7 +305,6 @@ static void checkShotStartStop() {
 }
 
 static void updateTempPID() {
-    spiSlaveSelect(MAX_CS);
     currentTemp = max31865.temperature(RNOMINAL, RREF);
     if (currentTemp < 0) currentTemp = lastTemp;
     lastPidTime = currentTime;
@@ -264,7 +334,8 @@ static void updateTempPWM() {
 }
 
 static void updatePressure() {
-    pressNow = analogRead(PRESS_PIN) * pressGrad + pressInt;
+    rawPress = analogRead(PRESS_PIN);
+    pressNow = rawPress * pressGrad + pressInt;
     pressSum -= pressBuff[pressBuffIdx % PRESS_BUFF_SIZE];
     pressBuff[pressBuffIdx % PRESS_BUFF_SIZE] = pressNow;
     pressSum += pressNow;
@@ -653,21 +724,25 @@ void setup() {
     analogSetAttenuation(ADC_11db);
 #endif
 
-    spiSlaves[0] = MAX_CS;
-    for (int i = 0; i < SPI_SLAVES; i++) pinMode(spiSlaves[i], OUTPUT);
+    pinMode(MAX_CS, OUTPUT);
     pinMode(HEAT_PIN, OUTPUT);
     pinMode(PRESS_PIN, INPUT);
-    pinMode(LOAD_PIN, INPUT);
     pinMode(FLOW_PIN, INPUT_PULLUP);
     pinMode(ZC_PIN, INPUT);
     pinMode(AC_SENS, INPUT);
     digitalWrite(HEAT_PIN, LOW);
     heaterState = false;
-    spiSlaveSelect(MAX_CS);
+
+    debugReadMAX31865();
+    // 🔎 Confirm MAX31865 is present and healthy
+    logMax31865Status();
 
     // zero pressure
     float startP = analogRead(PRESS_PIN) * pressGrad + pressInt;
-    if (startP > -PRESS_TOL && startP < PRESS_TOL) pressInt -= startP;
+    if (startP > -PRESS_TOL && startP < PRESS_TOL) {
+        pressInt -= startP;
+        LOG("Pressure Intercept reset to %f", pressInt);
+    }
 
     attachInterrupt(digitalPinToInterrupt(FLOW_PIN), flowInt, CHANGE);
     attachInterrupt(digitalPinToInterrupt(ZC_PIN), zcInt, RISING);
@@ -693,7 +768,6 @@ void setup() {
 }
 
 void loop() {
-    debugData = true;
     currentTime = millis();
 
     checkShotStartStop();
@@ -712,7 +786,9 @@ void loop() {
         lastSerialTime = currentTime;
     }
 
-    if (debugPrint && debugData) { /* optional debug printing */
+    if (debugPrint && (currentTime - lastLogTime) > LOG_CYCLE) { /* optional debug printing */
+        LOG("Pressure: Raw=%d, Now=%f Last=%f", rawPress, pressNow, lastPress);
+        lastLogTime = currentTime;
     }
 }
 
