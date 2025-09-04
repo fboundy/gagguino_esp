@@ -1,0 +1,4 @@
+(fp_lib_table
+  (version 7)
+  (lib (name "robotdyn")(type "KiCad")(uri "$(KIPRJMOD)/robotdyn.pretty")(options "")(descr ""))
+)

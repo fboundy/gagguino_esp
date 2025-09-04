@@ -1,0 +1,4 @@
+(sym_lib_table
+  (version 7)
+  (lib (name "gagguino")(type "KiCad")(uri "C:/Users/FrancisBoundy/Documents/PlatformIO/Projects/gagguino/kicad/gagguino_esp/gagguino.kicad_sym")(options "")(descr ""))
+)
