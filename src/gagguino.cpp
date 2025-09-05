@@ -7,6 +7,7 @@
 #include <ArduinoOTA.h>
 
 #include <cstdarg>
+#include <ctype.h>
 
 #include "secrets.h"  // WIFI_*, MQTT_*
 
@@ -76,6 +77,7 @@ float pGainTemp = P_GAIN_TEMP, iGainTemp = I_GAIN_TEMP, dGainTemp = D_GAIN_TEMP,
       windupGuardTemp = WINDUP_GUARD_TEMP;
 int heatCycles = 0;
 bool heaterState = false;
+bool heaterEnabled = true;  // HA switch default ON at boot
 
 // Pressure
 int rawPress = 0;
@@ -104,6 +106,7 @@ bool shotFlag = false, preFlow = false, steamFlag = false, setupComplete = false
 
 // OTA
 static bool otaInitialized = false;
+static bool otaActive = false;  // minimize other work while OTA is in progress
 
 // MQTT diagnostics
 static IPAddress g_mqttIp;
@@ -120,6 +123,8 @@ char uid_suffix[16] = {0};
 // Sensor state topics
 char t_shotvol_state[96], t_settemp_state[96], t_curtemp_state[96], t_press_state[96],
     t_shottime_state[96], t_ota_state[96];
+// Switch state/command topics
+char t_heater_state[96], t_heater_cmd[96];
 // Diagnostics state topics
 char t_accnt_state[96], t_zccnt_state[96], t_pulsecnt_state[96];
 // Binary sensor state topics
@@ -142,6 +147,8 @@ char c_pidp_number[128], c_pidi_number[128], c_pidd_number[128], c_pidg_number[1
 char c_shot[128], c_preflow[128], c_steam[128];
 char c_brewset_number[128], c_steamset_number[128];
 char c_brewset_sensor[128], c_steamset_sensor[128];
+// Switch config
+char c_heater[128];
 
 // ---------- helpers ----------
 static inline const char* wifiStatusName(wl_status_t s) {
@@ -192,7 +199,8 @@ static inline const char* mqttStateName(int8_t s) {
 }
 
 static void initMqttTuning() {
-    mqttClient.setKeepAlive(20);
+    // Longer keepalive so brief OTA stalls don't drop MQTT
+    mqttClient.setKeepAlive(60);
     mqttClient.setSocketTimeout(5);
     mqttClient.setBufferSize(1024);
 }
@@ -233,11 +241,14 @@ static void ensureOta() {
 
     ArduinoOTA.onStart([]() {
         LOG("OTA: Start (%s)", ArduinoOTA.getCommand() == U_FLASH ? "flash" : "fs");
-        if (mqttClient.connected()) publishStr(t_ota_state, "starting");
+        otaActive = true;  // signal loop to reduce load and suppress MQTT publishing
+        // Turn off heater to reduce power/noise during OTA
+        digitalWrite(HEAT_PIN, LOW);
+        heaterState = false;
     });
     ArduinoOTA.onEnd([]() {
         LOG("OTA: End");
-        if (mqttClient.connected()) publishStr(t_ota_state, "success");
+        otaActive = false;
     });
     ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
         static unsigned int lastPct = 101;
@@ -245,11 +256,6 @@ static void ensureOta() {
         if (pct != lastPct && (pct % 10u == 0u)) {
             LOG("OTA: %u%%", pct);
             lastPct = pct;
-        }
-        if (mqttClient.connected()) {
-            char buf[8];
-            snprintf(buf, sizeof(buf), "%u%%", pct);
-            publishStr(t_ota_state, String(buf));
         }
     });
     ArduinoOTA.onError([](ota_error_t error) {
@@ -262,7 +268,7 @@ static void ensureOta() {
             case OTA_END_ERROR: msg = "END"; break;
         }
         LOG("OTA: Error %d (%s)", (int)error, msg);
-        if (mqttClient.connected()) publishStr(t_ota_state, String("error:") + msg);
+        otaActive = false;
     });
 
     ArduinoOTA.begin();
@@ -392,6 +398,12 @@ static void updateTempPID() {
     currentTemp = max31865.temperature(RNOMINAL, RREF);
     if (currentTemp < 0) currentTemp = lastTemp;
     lastPidTime = currentTime;
+    if (!heaterEnabled) {
+        // Pause PID calculations when heater is disabled
+        heatPower = 0.0f;
+        heatCycles = PWM_CYCLE;
+        return;
+    }
 
     // Active target picks between brew and steam setpoints
     setTemp = steamFlag ? steamSetpoint : brewSetpoint;
@@ -404,6 +416,11 @@ static void updateTempPID() {
 }
 
 static void updateTempPWM() {
+    if (!heaterEnabled) {
+        digitalWrite(HEAT_PIN, LOW);
+        heaterState = false;
+        return;
+    }
     if (currentTime - lastPwmTime >= (unsigned long)heatCycles) {
         digitalWrite(HEAT_PIN, HIGH);
         heaterState = true;
@@ -489,6 +506,16 @@ static void buildTopics() {
     snprintf(t_shottime_state, sizeof(t_shottime_state), "%s/%s/shot_time/state", STATE_BASE,
              uid_suffix);
     snprintf(t_ota_state, sizeof(t_ota_state), "%s/%s/ota/status", STATE_BASE, uid_suffix);
+    // heater switch topics
+    snprintf(t_heater_state, sizeof(t_heater_state), "%s/%s/heater/state", STATE_BASE, uid_suffix);
+    snprintf(t_heater_cmd, sizeof(t_heater_cmd), "%s/%s/heater/set", STATE_BASE, uid_suffix);
+    // diagnostic counters states
+    snprintf(t_accnt_state, sizeof(t_accnt_state), "%s/%s/ac_count/state", STATE_BASE,
+             uid_suffix);
+    snprintf(t_zccnt_state, sizeof(t_zccnt_state), "%s/%s/zc_count/state", STATE_BASE,
+             uid_suffix);
+    snprintf(t_pulsecnt_state, sizeof(t_pulsecnt_state), "%s/%s/pulse_count/state", STATE_BASE,
+             uid_suffix);
     // binary sensor states
     snprintf(t_shot_state, sizeof(t_shot_state), "%s/%s/shot/state", STATE_BASE, uid_suffix);
     snprintf(t_preflow_state, sizeof(t_preflow_state), "%s/%s/preflow/state", STATE_BASE,
@@ -556,6 +583,8 @@ static void buildTopics() {
     snprintf(c_accnt, sizeof(c_accnt), "%s/sensor/%s_ac_count/config", DISCOVERY_PREFIX, dev_id);
     snprintf(c_zccnt, sizeof(c_zccnt), "%s/sensor/%s_zc_count/config", DISCOVERY_PREFIX, dev_id);
     snprintf(c_pulsecnt, sizeof(c_pulsecnt), "%s/sensor/%s_pulse_count/config", DISCOVERY_PREFIX, dev_id);
+    // switch
+    snprintf(c_heater, sizeof(c_heater), "%s/switch/%s_heater/config", DISCOVERY_PREFIX, dev_id);
 }
 
 static String deviceJson() {
@@ -668,6 +697,14 @@ static void publishDiscovery() {
             String(MQTT_STATUS) +
             "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}");
 
+    // --- switch: heater enable ---
+    publishRetained(
+        c_heater,
+        String("{\"name\":\"Heater\",\"uniq_id\":\"") + dev_id +
+            "_heater\",\"cmd_t\":\"" + t_heater_cmd + "\",\"stat_t\":\"" + t_heater_state +
+            "\",\"pl_on\":\"ON\",\"pl_off\":\"OFF\",\"avty_t\":\"" + String(MQTT_STATUS) +
+            "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}");
+
     // --- numbers (controllable) ---
     publishRetained(
         c_brewset_number,
@@ -759,6 +796,8 @@ static void publishStates() {
     publishNum(t_curtemp_state, currentTemp, 1);
     publishNum(t_press_state, lastPress, 1);
     publishNum(t_shottime_state, shotTime, 1);  // seconds
+    // heater switch state (retained so HA keeps last state)
+    publishBool(t_heater_state, heaterEnabled, true);
     // diagnostics
     publishNum(t_accnt_state, acCount, 0);
     publishNum(t_zccnt_state, zcCount, 0);
@@ -796,6 +835,22 @@ static void mqttCallback(char* topic, uint8_t* payload, unsigned int len) {
         outVal = v;
         return true;
     };
+    auto parse_onoff = [&](const char* t, bool& outVal) -> bool {
+        if (strcmp(topic, t) != 0) return false;
+        char buf[8] = {0};
+        unsigned n = (len < sizeof(buf) - 1) ? len : sizeof(buf) - 1;
+        memcpy(buf, payload, n);
+        for (unsigned i = 0; i < n; ++i) buf[i] = (char)toupper((unsigned char)buf[i]);
+        if (strcmp(buf, "ON") == 0) {
+            outVal = true;
+            return true;
+        }
+        if (strcmp(buf, "OFF") == 0) {
+            outVal = false;
+            return true;
+        }
+        return false;
+    };
     bool changed = false;
     if (parse_clamped(t_brewset_cmd, BREW_MIN, BREW_MAX, brewSetpoint)) {
         changed = true;
@@ -826,6 +881,19 @@ static void mqttCallback(char* topic, uint8_t* payload, unsigned int len) {
         windupGuardTemp = tmp;
         publishNum(t_pidg_state, windupGuardTemp, 2, true);
         LOG("HA: PID Guard -> %.2f", windupGuardTemp);
+    }
+    // heater switch
+    bool hv;
+    if (parse_onoff(t_heater_cmd, hv)) {
+        heaterEnabled = hv;
+        if (!heaterEnabled) {
+            heatPower = 0.0f;
+            heatCycles = PWM_CYCLE;
+            digitalWrite(HEAT_PIN, LOW);
+            heaterState = false;
+        }
+        publishBool(t_heater_state, heaterEnabled, true);
+        LOG("HA: Heater -> %s", heaterEnabled ? "ON" : "OFF");
     }
     if (changed) {
         if (!steamFlag) setTemp = brewSetpoint;  // if brewing, apply immediately
@@ -865,6 +933,10 @@ static void ensureWifi() {
 
 static void ensureMqtt() {
     mqttClient.loop();
+    if (otaActive) {
+        // Avoid connect/discovery/publishing churn during OTA
+        return;
+    }
     static bool lastConn = false;
     if (WiFi.status() != WL_CONNECTED) {
         lastConn = false;
@@ -885,6 +957,8 @@ static void ensureMqtt() {
             mqttClient.subscribe(t_pidi_cmd);
             mqttClient.subscribe(t_pidd_cmd);
             mqttClient.subscribe(t_pidg_cmd);
+            // heater switch
+            mqttClient.subscribe(t_heater_cmd);
         }
         lastConn = true;
         return;
@@ -956,6 +1030,10 @@ void setup() {
 
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+#if defined(ARDUINO_ARCH_ESP32)
+    // Improve OTA/MQTT reliability by disabling WiFi modem sleep
+    WiFi.setSleep(false);
+#endif
     mqttClient.setServer(MQTT_HOST, MQTT_PORT);
     mqttClient.setCallback(mqttCallback);
     initMqttTuning();
@@ -970,13 +1048,16 @@ void setup() {
 void loop() {
     currentTime = millis();
 
-    checkShotStartStop();
-    if (currentTime - lastPidTime >= PID_CYCLE) updateTempPID();
-    updateTempPWM();
-    updatePressure();
-    updatePreFlow();
-    updateVols();
-    updateSteamFlag();
+    // During OTA, minimize work to keep WiFi/TCP responsive
+    if (!otaActive) {
+        checkShotStartStop();
+        if (currentTime - lastPidTime >= PID_CYCLE) updateTempPID();
+        updateTempPWM();
+        updatePressure();
+        updatePreFlow();
+        updateVols();
+        updateSteamFlag();
+    }
 
     // Update shot time continuously while shot is active (seconds)
     if (shotFlag) {
@@ -988,12 +1069,12 @@ void loop() {
     ensureOta();
     if (WiFi.status() == WL_CONNECTED) ArduinoOTA.handle();
 
-    if (streamData && (currentTime - lastSerialTime) > SER_OUT_CYCLE) {
+    if (!otaActive && streamData && (currentTime - lastSerialTime) > SER_OUT_CYCLE) {
         if (mqttClient.connected()) publishStates();
         lastSerialTime = currentTime;
     }
 
-    if (debugPrint && (currentTime - lastLogTime) > LOG_CYCLE) { /* optional debug printing */
+    if (!otaActive && debugPrint && (currentTime - lastLogTime) > LOG_CYCLE) { /* optional debug printing */
         LOG("Pressure: Raw=%d, Now=%0.2f Last=%0.2f", rawPress, pressNow, lastPress);
         LOG("Temp: Set=%0.1f, Current=%0.2f", setTemp, currentTemp);        
         LOG("Heat: Power=%0.1f, Cycles=%d",heatPower, heatCycles);     
