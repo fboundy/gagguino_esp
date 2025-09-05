@@ -115,7 +115,7 @@ char uid_suffix[16] = {0};
 
 // Sensor state topics
 char t_shotvol_state[96], t_settemp_state[96], t_curtemp_state[96], t_press_state[96],
-    t_shottime_state[96];
+    t_shottime_state[96], t_ota_state[96];
 // Binary sensor state topics
 char t_shot_state[96], t_preflow_state[96], t_steam_state[96];
 // Number entities (brew/steam setpoint) command/state topics
@@ -125,7 +125,7 @@ char t_steamset_state[96], t_steamset_cmd[96];
 char t_brewset_sensor_state[96], t_steamset_sensor_state[96];
 
 // Config topics
-char c_shotvol[128], c_settemp[128], c_curtemp[128], c_press[128], c_shottime[128];
+char c_shotvol[128], c_settemp[128], c_curtemp[128], c_press[128], c_shottime[128], c_ota[128];
 char c_shot[128], c_preflow[128], c_steam[128];
 char c_brewset_number[128], c_steamset_number[128];
 char c_brewset_sensor[128], c_steamset_sensor[128];
@@ -218,14 +218,23 @@ static void ensureOta() {
 
     ArduinoOTA.onStart([]() {
         LOG("OTA: Start (%s)", ArduinoOTA.getCommand() == U_FLASH ? "flash" : "fs");
+        if (mqttClient.connected()) publishStr(t_ota_state, "starting");
     });
-    ArduinoOTA.onEnd([]() { LOG("OTA: End"); });
+    ArduinoOTA.onEnd([]() {
+        LOG("OTA: End");
+        if (mqttClient.connected()) publishStr(t_ota_state, "success");
+    });
     ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
         static unsigned int lastPct = 101;
         unsigned int pct = (total ? (progress * 100u / total) : 0u);
         if (pct != lastPct && (pct % 10u == 0u)) {
             LOG("OTA: %u%%", pct);
             lastPct = pct;
+        }
+        if (mqttClient.connected()) {
+            char buf[8];
+            snprintf(buf, sizeof(buf), "%u%%", pct);
+            publishStr(t_ota_state, String(buf));
         }
     });
     ArduinoOTA.onError([](ota_error_t error) {
@@ -238,6 +247,7 @@ static void ensureOta() {
             case OTA_END_ERROR: msg = "END"; break;
         }
         LOG("OTA: Error %d (%s)", (int)error, msg);
+        if (mqttClient.connected()) publishStr(t_ota_state, String("error:") + msg);
     });
 
     ArduinoOTA.begin();
@@ -457,6 +467,7 @@ static void buildTopics() {
     snprintf(t_press_state, sizeof(t_press_state), "%s/%s/pressure/state", STATE_BASE, uid_suffix);
     snprintf(t_shottime_state, sizeof(t_shottime_state), "%s/%s/shot_time/state", STATE_BASE,
              uid_suffix);
+    snprintf(t_ota_state, sizeof(t_ota_state), "%s/%s/ota/status", STATE_BASE, uid_suffix);
     // binary sensor states
     snprintf(t_shot_state, sizeof(t_shot_state), "%s/%s/shot/state", STATE_BASE, uid_suffix);
     snprintf(t_preflow_state, sizeof(t_preflow_state), "%s/%s/preflow/state", STATE_BASE,
@@ -487,6 +498,7 @@ static void buildTopics() {
     snprintf(c_press, sizeof(c_press), "%s/sensor/%s_pressure/config", DISCOVERY_PREFIX, dev_id);
     snprintf(c_shottime, sizeof(c_shottime), "%s/sensor/%s_shot_time/config", DISCOVERY_PREFIX,
              dev_id);
+    snprintf(c_ota, sizeof(c_ota), "%s/sensor/%s_ota_status/config", DISCOVERY_PREFIX, dev_id);
 
     snprintf(c_shot, sizeof(c_shot), "%s/binary_sensor/%s_shot/config", DISCOVERY_PREFIX, dev_id);
     snprintf(c_preflow, sizeof(c_preflow), "%s/binary_sensor/%s_preflow/config", DISCOVERY_PREFIX,
@@ -562,6 +574,15 @@ static void publishDiscovery() {
                         "_shot_time\",\"stat_t\":\"" + t_shottime_state +
                         "\",\"dev_cla\":\"duration\",\"unit_of_meas\":\"s\",\"stat_cla\":"
                         "\"measurement\",\"avty_t\":\"" +
+                        String(MQTT_STATUS) +
+                        "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev +
+                        "}");
+
+    // OTA status (diagnostic sensor)
+    publishRetained(c_ota,
+                    String("{\"name\":\"OTA Status\",\"uniq_id\":\"") + dev_id +
+                        "_ota_status\",\"stat_t\":\"" + t_ota_state +
+                        "\",\"entity_category\":\"diagnostic\",\"avty_t\":\"" +
                         String(MQTT_STATUS) +
                         "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev +
                         "}");
