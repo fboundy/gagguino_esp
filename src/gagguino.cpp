@@ -739,7 +739,7 @@ static void publishDiscovery() {
 }
 
 // ---------- publishing states ----------
-static void publishStr(const char* topic, const String& v, bool retain = false) {
+static void publishStr(const char* topic, const String& v, bool retain) {
     if (!mqttClient.publish(topic, v.c_str(), retain))
         LOG("MQTT: state publish failed (%s) val=%s", topic, v.c_str());
 }
