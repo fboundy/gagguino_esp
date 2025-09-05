@@ -1,0 +1,36 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "PIO Upload (esp32dev_ota)",
+      "type": "shell",
+      "command": "pio run -t upload -e esp32dev_ota",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "PIO Upload (esp32dev serial)",
+      "type": "shell",
+      "command": "pio run -t upload -e esp32dev",
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "PIO Build (default)",
+      "type": "shell",
+      "command": "pio run",
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "PIO Monitor (serial)",
+      "type": "shell",
+      "command": "pio device monitor -e esp32dev",
+      "problemMatcher": []
+    }
+  ]
+}
+
