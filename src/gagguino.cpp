@@ -213,6 +213,8 @@ static void resolveBrokerIfNeeded() {
 }
 
 // ---------- OTA ----------
+// Forward declaration for MQTT publish helper used in OTA callbacks
+static void publishStr(const char* topic, const String& v, bool retain = false);
 static void ensureOta() {
     if (otaInitialized || WiFi.status() != WL_CONNECTED) return;
 
