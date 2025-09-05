@@ -4,6 +4,7 @@
 #include <Arduino.h>
 #include <PubSubClient.h>
 #include <WiFi.h>
+#include <ArduinoOTA.h>
 
 #include <cstdarg>
 
@@ -96,6 +97,9 @@ unsigned int lastVol = 0;
 bool prevSteamFlag = false, ac = false;
 int acCount = 0;
 bool shotFlag = false, preFlow = false, steamFlag = false, setupComplete = false, debugData = false;
+
+// OTA
+static bool otaInitialized = false;
 
 // MQTT diagnostics
 static IPAddress g_mqttIp;
@@ -193,6 +197,52 @@ static void resolveBrokerIfNeeded() {
         mqttClient.setServer(g_mqttIp, MQTT_PORT);
     } else
         LOG("MQTT: DNS resolve failed for %s", MQTT_HOST);
+}
+
+// ---------- OTA ----------
+static void ensureOta() {
+    if (otaInitialized || WiFi.status() != WL_CONNECTED) return;
+
+    // Derive a stable hostname from MAC
+    uint8_t mac[6];
+    WiFi.macAddress(mac);
+    char host[32];
+    snprintf(host, sizeof(host), "gaggia-%02X%02X%02X", mac[3], mac[4], mac[5]);
+
+    ArduinoOTA.setHostname(host);
+#if defined(OTA_PASSWORD_HASH)
+    ArduinoOTA.setPasswordHash(OTA_PASSWORD_HASH);
+#elif defined(OTA_PASSWORD)
+    ArduinoOTA.setPassword(OTA_PASSWORD);
+#endif
+
+    ArduinoOTA.onStart([]() {
+        LOG("OTA: Start (%s)", ArduinoOTA.getCommand() == U_FLASH ? "flash" : "fs");
+    });
+    ArduinoOTA.onEnd([]() { LOG("OTA: End"); });
+    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+        static unsigned int lastPct = 101;
+        unsigned int pct = (total ? (progress * 100u / total) : 0u);
+        if (pct != lastPct && (pct % 10u == 0u)) {
+            LOG("OTA: %u%%", pct);
+            lastPct = pct;
+        }
+    });
+    ArduinoOTA.onError([](ota_error_t error) {
+        const char* msg = "UNKNOWN";
+        switch (error) {
+            case OTA_AUTH_ERROR: msg = "AUTH"; break;
+            case OTA_BEGIN_ERROR: msg = "BEGIN"; break;
+            case OTA_CONNECT_ERROR: msg = "CONNECT"; break;
+            case OTA_RECEIVE_ERROR: msg = "RECEIVE"; break;
+            case OTA_END_ERROR: msg = "END"; break;
+        }
+        LOG("OTA: Error %d (%s)", (int)error, msg);
+    });
+
+    ArduinoOTA.begin();
+    otaInitialized = true;
+    LOG("OTA: Ready as %s.local", host);
 }
 
 static float calcPID(float p, float i, float d, float sp, float pv, float& lastPv, float& iSum,
@@ -789,6 +839,8 @@ void loop() {
 
     ensureWifi();
     ensureMqtt();
+    ensureOta();
+    if (WiFi.status() == WL_CONNECTED) ArduinoOTA.handle();
 
     if (streamData && (currentTime - lastSerialTime) > SER_OUT_CYCLE) {
         if (mqttClient.connected()) publishStates();
