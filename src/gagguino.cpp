@@ -24,7 +24,7 @@ static inline void LOG(const char* fmt, ...) {
 
 namespace {
 constexpr int FLOW_PIN = 26, ZC_PIN = 25, HEAT_PIN = 27, AC_SENS = 14;
-constexpr int SPI_MOSI = 23, SPI_MISO = 19, SPI_SCK = 18, MAX_CS = 5;
+constexpr int MAX_CS = 16;
 constexpr int PRESS_PIN = 35;
 
 constexpr unsigned long PRESS_CYCLE = 100, PID_CYCLE = 500, PWM_CYCLE = 500, SER_OUT_CYCLE = 200,
@@ -41,7 +41,7 @@ constexpr float RREF = 430.0f, RNOMINAL = 100.0f;
 constexpr float P_GAIN_TEMP = 20.0f, I_GAIN_TEMP = 1.0f, D_GAIN_TEMP = 100.0f,
                 WINDUP_GUARD_TEMP = 20.0f;
 
-constexpr float PRESS_TOL = 0.4f, PRESS_GRAD = 0.00903f, PRESS_INT_0 = -5.6f;
+constexpr float PRESS_TOL = 0.4f, PRESS_GRAD = 0.00903f, PRESS_INT_0 = -4.0f;
 constexpr int PRESS_BUFF_SIZE = 14;
 constexpr float PRESS_THRESHOLD = 9.0f;
 
@@ -59,7 +59,7 @@ const bool streamData = true, debugPrint = true;
 
 // ---------- Devices / globals ----------
 namespace {
-Adafruit_MAX31865 max31865(MAX_CS, SPI_MOSI, SPI_MISO, SPI_SCK);
+Adafruit_MAX31865 max31865(MAX_CS);
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
 
@@ -216,9 +216,6 @@ static void debugReadMAX31865() {
     max31865.autoConvert(false);
     delay(1);
 
-    pinMode(MAX_CS, OUTPUT);
-    digitalWrite(MAX_CS, LOW);
-
     uint16_t raw = max31865.readRTD();  // Library returns 15-bit value (D15..D1), LSB is fault
     // Some forks return the unshifted word. Normalize defensively:
     uint16_t rtd = (raw > 32768) ? (raw >> 1) : raw;
@@ -255,8 +252,7 @@ static void logMax31865Status() {
 
     // If the chip isn't on the bus, many MCUs will read 0xFF on MISO
     if (f == 0xFF) {
-        LOG("MAX31865: no SPI response (CS=%d SCK=%d MISO=%d MOSI=%d) — check wiring/power", MAX_CS,
-            SPI_SCK, SPI_MISO, SPI_MOSI);
+        LOG("MAX31865: no SPI response (CS=%d) — check wiring/power", MAX_CS);
         return;
     }
 
@@ -729,7 +725,7 @@ void setup() {
     pinMode(PRESS_PIN, INPUT);
     pinMode(FLOW_PIN, INPUT_PULLUP);
     pinMode(ZC_PIN, INPUT);
-    pinMode(AC_SENS, INPUT);
+    pinMode(AC_SENS, INPUT_PULLUP);
     digitalWrite(HEAT_PIN, LOW);
     heaterState = false;
 
@@ -761,8 +757,8 @@ void setup() {
     initMqttTuning();
     resolveBrokerIfNeeded();
 
-    LOG("Pins: FLOW=%d ZC=%d HEAT=%d AC_SENS=%d PRESS=%d  SPI{MOSI=%d,MISO=%d,SCK=%d,CS=%d}",
-        FLOW_PIN, ZC_PIN, HEAT_PIN, AC_SENS, PRESS_PIN, SPI_MOSI, SPI_MISO, SPI_SCK, MAX_CS);
+    LOG("Pins: FLOW=%d ZC=%d HEAT=%d AC_SENS=%d PRESS=%d  SPI{CS=%d}",
+        FLOW_PIN, ZC_PIN, HEAT_PIN, AC_SENS, PRESS_PIN, MAX_CS);
     LOG("WiFi: connecting to '%s'…  MQTT: %s:%u id=%s", WIFI_SSID, MQTT_HOST, MQTT_PORT,
         MQTT_CLIENTID);
 }
@@ -787,7 +783,14 @@ void loop() {
     }
 
     if (debugPrint && (currentTime - lastLogTime) > LOG_CYCLE) { /* optional debug printing */
-        LOG("Pressure: Raw=%d, Now=%f Last=%f", rawPress, pressNow, lastPress);
+        LOG("Pressure: Raw=%d, Now=%0.2f Last=%0.2f", rawPress, pressNow, lastPress);
+        LOG("Temp: Set=%0.1f, Current=%0.2f", setTemp, currentTemp);        
+        LOG("Heat: Power=%0.1f, Cycles=%d",heatPower, heatCycles);     
+        LOG("Vol: Pulses=%d, Vol= %f", pulseCount, vol);
+        LOG("Pump: ZC Count =%d", zcCount);
+        LOG("Flags: Steam=%d, Shot=%d", steamFlag, shotFlag);
+        LOG("AC Count=%d", acCount);
+        LOG("");
         lastLogTime = currentTime;
     }
 }
