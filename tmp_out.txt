@@ -1,0 +1,63 @@
+    // zero pressure
+    float startP = analogRead(PRESS_PIN) * pressGrad + pressInt;
+    if (startP > -PRESS_TOL && startP < PRESS_TOL) {
+        pressInt -= startP;
+        LOG("Pressure Intercept reset to %f", pressInt);
+    }
+
+    attachInterrupt(digitalPinToInterrupt(FLOW_PIN), flowInt, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ZC_PIN), zcInt, RISING);
+
+    pulseCount = 0;
+    startTime = millis();
+    lastPidTime = startTime;
+    lastPwmTime = startTime;
+    lastPulseTime = startTime;
+    setupComplete = true;
+
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+    mqttClient.setCallback(mqttCallback);
+    initMqttTuning();
+    resolveBrokerIfNeeded();
+
+    LOG("Pins: FLOW=%d ZC=%d HEAT=%d AC_SENS=%d PRESS=%d  SPI{CS=%d}",
+        FLOW_PIN, ZC_PIN, HEAT_PIN, AC_SENS, PRESS_PIN, MAX_CS);
+    LOG("WiFi: connecting to '%s'…  MQTT: %s:%u id=%s", WIFI_SSID, MQTT_HOST, MQTT_PORT,
+        MQTT_CLIENTID);
+}
+
+void loop() {
+    currentTime = millis();
+
+    checkShotStartStop();
+    if (currentTime - lastPidTime >= PID_CYCLE) updateTempPID();
+    updateTempPWM();
+    updatePressure();
+    updatePreFlow();
+    updateVols();
+    updateSteamFlag();
+
+    ensureWifi();
+    ensureMqtt();
+
+    if (streamData && (currentTime - lastSerialTime) > SER_OUT_CYCLE) {
+        if (mqttClient.connected()) publishStates();
+        lastSerialTime = currentTime;
+    }
+
+    if (debugPrint && (currentTime - lastLogTime) > LOG_CYCLE) { /* optional debug printing */
+        LOG("Pressure: Raw=%d, Now=%0.2f Last=%0.2f", rawPress, pressNow, lastPress);
+        LOG("Temp: Set=%0.1f, Current=%0.2f", setTemp, currentTemp);        
+        LOG("Heat: Power=%0.1f, Cycles=%d",heatPower, heatCycles);     
+        LOG("Vol: Pulses=%d, Vol= %f", pulseCount, vol);
+        LOG("Pump: ZC Count =%d", zcCount);
+        LOG("Flags: Steam=%d, Shot=%d", steamFlag, shotFlag);
+        LOG("AC Count=%d", acCount);
+        LOG("");
+        lastLogTime = currentTime;
+    }
+}
+
+}  // namespace gag

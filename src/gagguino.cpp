@@ -77,17 +77,20 @@ int rawPress = 0;
 float lastPress = 0.0f, pressNow = 0.0f, pressSum = 0.0f, pressGrad = PRESS_GRAD,
       pressInt = PRESS_INT_0;
 float pressBuff[PRESS_BUFF_SIZE] = {0};
-long pressBuffIdx = 0;
+uint8_t pressBuffIdx = 0;
 
 // Time/shot
 unsigned long nLoop = 0, currentTime = 0, lastPidTime = 0, lastPwmTime = 0, lastSerialTime = 0,
               lastLogTime = 0;
 ;
-unsigned long lastPulseTime = 0, shotStart = 0, startTime = 0;
+volatile unsigned long lastPulseTime = 0;
+unsigned long shotStart = 0, startTime = 0;
 float shotTime = 0;  //
 
 // Flow / flags
-unsigned long pulseCount = 0, zcCount = 0, lastZcTime = 0;
+volatile unsigned long pulseCount = 0;
+volatile unsigned long zcCount = 0;
+volatile unsigned long lastZcTime = 0;
 int vol = 0, preFlowVol = 0, shotVol = 0;
 unsigned int lastVol = 0;
 bool prevSteamFlag = false, ac = false;
@@ -181,11 +184,13 @@ static void resolveBrokerIfNeeded() {
     if (g_mqttIp.fromString(MQTT_HOST)) {
         g_mqttIpResolved = true;
         LOG("MQTT: using literal host %s", g_mqttIp.toString().c_str());
+        mqttClient.setServer(g_mqttIp, MQTT_PORT);
         return;
     }
     if (WiFi.hostByName(MQTT_HOST, g_mqttIp) == 1) {
         g_mqttIpResolved = true;
         LOG("MQTT: %s resolved to %s", MQTT_HOST, g_mqttIp.toString().c_str());
+        mqttClient.setServer(g_mqttIp, MQTT_PORT);
     } else
         LOG("MQTT: DNS resolve failed for %s", MQTT_HOST);
 }
@@ -268,12 +273,14 @@ static void logMax31865Status() {
         max31865.clearFault();
     } else {
         // Read raw ratio (0..1), calculate resistance, and temperature
-        float ratio = max31865.readRTD() / 32768.0f;
+        uint16_t raw = max31865.readRTD();
+        uint16_t rtd = (raw > 32768) ? (raw >> 1) : raw;
+        float ratio = (float)rtd / 32768.0f;
         float resistance = ratio * RREF;
         float tempC = max31865.temperature(RNOMINAL, RREF);
 
-        LOG("MAX31865: connected; RTD ratio=%.6f  R=%.2f Ω  Temp=%.2f °C", ratio, resistance,
-            tempC);
+        LOG("MAX31865: connected; raw=0x%04X rtd=%u ratio=%.6f  R=%.2f Ω  Temp=%.2f °C", raw, rtd,
+            ratio, resistance, tempC);
     }
 }
 
@@ -332,10 +339,12 @@ static void updateTempPWM() {
 static void updatePressure() {
     rawPress = analogRead(PRESS_PIN);
     pressNow = rawPress * pressGrad + pressInt;
-    pressSum -= pressBuff[pressBuffIdx % PRESS_BUFF_SIZE];
-    pressBuff[pressBuffIdx % PRESS_BUFF_SIZE] = pressNow;
+    uint8_t idx = pressBuffIdx;
+    pressSum -= pressBuff[idx];
+    pressBuff[idx] = pressNow;
     pressSum += pressNow;
     pressBuffIdx++;
+    if (pressBuffIdx >= PRESS_BUFF_SIZE) pressBuffIdx = 0;
     lastPress = pressSum / PRESS_BUFF_SIZE;
 }
 
@@ -362,7 +371,6 @@ static void updatePreFlow() {
 
 static void updateVols() {
     vol = (int)(pulseCount * FLOW_CAL);
-    if (vol > 0 && vol > lastVol) shotTime = (currentTime - shotStart) / 100;
     lastVol = vol;
     shotVol = (preFlow || !shotFlag) ? 0 : (vol - preFlowVol);
 }
@@ -590,7 +598,7 @@ static void publishStates() {
     publishNum(t_settemp_state, setTemp, 1);  // active target
     publishNum(t_curtemp_state, currentTemp, 1);
     publishNum(t_press_state, lastPress, 1);
-    publishNum(t_shottime_state, shotTime / 10.0f, 1);  // seconds
+    publishNum(t_shottime_state, shotTime, 1);  // seconds
 
     // flags
     publishBool(t_shot_state, shotFlag);
@@ -774,6 +782,11 @@ void loop() {
     updateVols();
     updateSteamFlag();
 
+    // Update shot time continuously while shot is active (seconds)
+    if (shotFlag) {
+        shotTime = (currentTime - shotStart) / 1000.0f;
+    }
+
     ensureWifi();
     ensureMqtt();
 
@@ -786,8 +799,8 @@ void loop() {
         LOG("Pressure: Raw=%d, Now=%0.2f Last=%0.2f", rawPress, pressNow, lastPress);
         LOG("Temp: Set=%0.1f, Current=%0.2f", setTemp, currentTemp);        
         LOG("Heat: Power=%0.1f, Cycles=%d",heatPower, heatCycles);     
-        LOG("Vol: Pulses=%d, Vol= %f", pulseCount, vol);
-        LOG("Pump: ZC Count =%d", zcCount);
+        LOG("Vol: Pulses=%lu, Vol=%d", pulseCount, vol);
+        LOG("Pump: ZC Count =%lu", zcCount);
         LOG("Flags: Steam=%d, Shot=%d", steamFlag, shotFlag);
         LOG("AC Count=%d", acCount);
         LOG("");
