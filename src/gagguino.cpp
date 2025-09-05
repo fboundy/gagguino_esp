@@ -39,6 +39,7 @@ constexpr float STEAM_MIN_C = 145.0f, STEAM_MAX_C = 155.0f;
 constexpr float STEAM_DEFAULT = 152.0f;
 
 constexpr float RREF = 430.0f, RNOMINAL = 100.0f;
+// Default PID params (overridable via MQTT number entities)
 constexpr float P_GAIN_TEMP = 20.0f, I_GAIN_TEMP = 1.0f, D_GAIN_TEMP = 100.0f,
                 WINDUP_GUARD_TEMP = 20.0f;
 
@@ -70,6 +71,9 @@ float brewSetpoint = 95.0f;           // HA-controllable (90–99)
 float steamSetpoint = STEAM_DEFAULT;  // HA-controllable (145–155)
 float setTemp = brewSetpoint;         // active target (brew or steam)
 float iStateTemp = 0.0f, heatPower = 0.0f;
+// Live-tunable PID parameters (default to constexprs above)
+float pGainTemp = P_GAIN_TEMP, iGainTemp = I_GAIN_TEMP, dGainTemp = D_GAIN_TEMP,
+      windupGuardTemp = WINDUP_GUARD_TEMP;
 int heatCycles = 0;
 bool heaterState = false;
 
@@ -116,16 +120,25 @@ char uid_suffix[16] = {0};
 // Sensor state topics
 char t_shotvol_state[96], t_settemp_state[96], t_curtemp_state[96], t_press_state[96],
     t_shottime_state[96], t_ota_state[96];
+// Diagnostics state topics
+char t_accnt_state[96], t_zccnt_state[96], t_pulsecnt_state[96];
 // Binary sensor state topics
 char t_shot_state[96], t_preflow_state[96], t_steam_state[96];
 // Number entities (brew/steam setpoint) command/state topics
 char t_brewset_state[96], t_brewset_cmd[96];
 char t_steamset_state[96], t_steamset_cmd[96];
+// PID number entity topics
+char t_pidp_state[96], t_pidp_cmd[96];
+char t_pidi_state[96], t_pidi_cmd[96];
+char t_pidd_state[96], t_pidd_cmd[96];
+char t_pidg_state[96], t_pidg_cmd[96];
 // Sensor “mirror” of setpoints for verification
 char t_brewset_sensor_state[96], t_steamset_sensor_state[96];
 
 // Config topics
 char c_shotvol[128], c_settemp[128], c_curtemp[128], c_press[128], c_shottime[128], c_ota[128];
+char c_accnt[128], c_zccnt[128], c_pulsecnt[128];
+char c_pidp_number[128], c_pidi_number[128], c_pidd_number[128], c_pidg_number[128];
 char c_shot[128], c_preflow[128], c_steam[128];
 char c_brewset_number[128], c_steamset_number[128];
 char c_brewset_sensor[128], c_steamset_sensor[128];
@@ -259,10 +272,16 @@ static float calcPID(float p, float i, float d, float sp, float pv, float& lastP
                      float guard) {
     float err = sp - pv;
     iSum += err;
-    if (iSum > guard / i)
-        iSum = guard / i;
-    else if (iSum < -guard / i)
-        iSum = -guard / i;
+    if (i != 0.0f) {
+        float lim = guard / i;
+        if (iSum > lim)
+            iSum = lim;
+        else if (iSum < -lim)
+            iSum = -lim;
+    } else {
+        // No integral action; prevent growth
+        iSum = 0.0f;
+    }
     float out = p * err + i * iSum - d * (pv - lastPv);
     lastPv = pv;
     return out;
@@ -375,8 +394,8 @@ static void updateTempPID() {
     // Active target picks between brew and steam setpoints
     setTemp = steamFlag ? steamSetpoint : brewSetpoint;
 
-    heatPower = calcPID(P_GAIN_TEMP, I_GAIN_TEMP, D_GAIN_TEMP, setTemp, currentTemp, lastTemp,
-                        iStateTemp, WINDUP_GUARD_TEMP);
+    heatPower = calcPID(pGainTemp, iGainTemp, dGainTemp, setTemp, currentTemp, lastTemp,
+                        iStateTemp, windupGuardTemp);
     if (heatPower > 100.0f) heatPower = 100.0f;
     if (heatPower < 0.0f) heatPower = 0.0f;
     heatCycles = (int)((100.0f - heatPower) / 100.0f * PWM_CYCLE);
@@ -482,6 +501,15 @@ static void buildTopics() {
              uid_suffix);
     snprintf(t_steamset_state, sizeof(t_steamset_state), "%s/%s/steam_setpoint/state", STATE_BASE,
              uid_suffix);
+    // PID numbers
+    snprintf(t_pidp_cmd, sizeof(t_pidp_cmd), "%s/%s/pid_p/set", STATE_BASE, uid_suffix);
+    snprintf(t_pidp_state, sizeof(t_pidp_state), "%s/%s/pid_p/state", STATE_BASE, uid_suffix);
+    snprintf(t_pidi_cmd, sizeof(t_pidi_cmd), "%s/%s/pid_i/set", STATE_BASE, uid_suffix);
+    snprintf(t_pidi_state, sizeof(t_pidi_state), "%s/%s/pid_i/state", STATE_BASE, uid_suffix);
+    snprintf(t_pidd_cmd, sizeof(t_pidd_cmd), "%s/%s/pid_d/set", STATE_BASE, uid_suffix);
+    snprintf(t_pidd_state, sizeof(t_pidd_state), "%s/%s/pid_d/state", STATE_BASE, uid_suffix);
+    snprintf(t_pidg_cmd, sizeof(t_pidg_cmd), "%s/%s/pid_guard/set", STATE_BASE, uid_suffix);
+    snprintf(t_pidg_state, sizeof(t_pidg_state), "%s/%s/pid_guard/state", STATE_BASE, uid_suffix);
     // sensor mirrors of setpoints
     snprintf(t_brewset_sensor_state, sizeof(t_brewset_sensor_state), "%s/%s/brew_setpoint/state",
              STATE_BASE, uid_suffix);
@@ -511,12 +539,21 @@ static void buildTopics() {
              DISCOVERY_PREFIX, dev_id);
     snprintf(c_steamset_number, sizeof(c_steamset_number), "%s/number/%s_steam_setpoint/config",
              DISCOVERY_PREFIX, dev_id);
+    // PID numbers
+    snprintf(c_pidp_number, sizeof(c_pidp_number), "%s/number/%s_pid_p/config", DISCOVERY_PREFIX, dev_id);
+    snprintf(c_pidi_number, sizeof(c_pidi_number), "%s/number/%s_pid_i/config", DISCOVERY_PREFIX, dev_id);
+    snprintf(c_pidd_number, sizeof(c_pidd_number), "%s/number/%s_pid_d/config", DISCOVERY_PREFIX, dev_id);
+    snprintf(c_pidg_number, sizeof(c_pidg_number), "%s/number/%s_pid_guard/config", DISCOVERY_PREFIX, dev_id);
 
     // sensor mirrors for setpoints
     snprintf(c_brewset_sensor, sizeof(c_brewset_sensor), "%s/sensor/%s_brew_setpoint/config",
              DISCOVERY_PREFIX, dev_id);
     snprintf(c_steamset_sensor, sizeof(c_steamset_sensor), "%s/sensor/%s_steam_setpoint/config",
              DISCOVERY_PREFIX, dev_id);
+    // diagnostic sensors
+    snprintf(c_accnt, sizeof(c_accnt), "%s/sensor/%s_ac_count/config", DISCOVERY_PREFIX, dev_id);
+    snprintf(c_zccnt, sizeof(c_zccnt), "%s/sensor/%s_zc_count/config", DISCOVERY_PREFIX, dev_id);
+    snprintf(c_pulsecnt, sizeof(c_pulsecnt), "%s/sensor/%s_pulse_count/config", DISCOVERY_PREFIX, dev_id);
 }
 
 static String deviceJson() {
@@ -587,6 +624,26 @@ static void publishDiscovery() {
                         "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev +
                         "}");
 
+    // Diagnostic counters
+    publishRetained(c_accnt,
+                    String("{\"name\":\"AC Count\",\"uniq_id\":\"") + dev_id +
+                        "_ac_count\",\"stat_t\":\"" + t_accnt_state +
+                        "\",\"stat_cla\":\"measurement\",\"entity_category\":\"diagnostic\",\"avty_t\":\"" +
+                        String(MQTT_STATUS) +
+                        "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}");
+    publishRetained(c_zccnt,
+                    String("{\"name\":\"ZC Count\",\"uniq_id\":\"") + dev_id +
+                        "_zc_count\",\"stat_t\":\"" + t_zccnt_state +
+                        "\",\"stat_cla\":\"measurement\",\"entity_category\":\"diagnostic\",\"avty_t\":\"" +
+                        String(MQTT_STATUS) +
+                        "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}");
+    publishRetained(c_pulsecnt,
+                    String("{\"name\":\"Pulse Count\",\"uniq_id\":\"") + dev_id +
+                        "_pulse_count\",\"stat_t\":\"" + t_pulsecnt_state +
+                        "\",\"stat_cla\":\"measurement\",\"entity_category\":\"diagnostic\",\"avty_t\":\"" +
+                        String(MQTT_STATUS) +
+                        "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}");
+
     // --- binary sensors ---
     publishRetained(
         c_shot, String("{\"name\":\"Shot\",\"uniq_id\":\"") + dev_id + "_shot\",\"stat_t\":\"" +
@@ -629,6 +686,36 @@ static void publishDiscovery() {
                         "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev +
                         "}");
 
+    // PID number entities
+    publishRetained(
+        c_pidp_number,
+        String("{\"name\":\"PID P\",\"uniq_id\":\"") + dev_id +
+            "_pid_p\",\"cmd_t\":\"" + t_pidp_cmd + "\",\"stat_t\":\"" + t_pidp_state +
+            "\",\"min\":0,\"max\":200,\"step\":0.1,\"mode\":\"auto\",\"avty_t\":\"" +
+            String(MQTT_STATUS) +
+            "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}");
+    publishRetained(
+        c_pidi_number,
+        String("{\"name\":\"PID I\",\"uniq_id\":\"") + dev_id +
+            "_pid_i\",\"cmd_t\":\"" + t_pidi_cmd + "\",\"stat_t\":\"" + t_pidi_state +
+            "\",\"min\":0,\"max\":10,\"step\":0.05,\"mode\":\"auto\",\"avty_t\":\"" +
+            String(MQTT_STATUS) +
+            "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}");
+    publishRetained(
+        c_pidd_number,
+        String("{\"name\":\"PID D\",\"uniq_id\":\"") + dev_id +
+            "_pid_d\",\"cmd_t\":\"" + t_pidd_cmd + "\",\"stat_t\":\"" + t_pidd_state +
+            "\",\"min\":0,\"max\":500,\"step\":0.5,\"mode\":\"auto\",\"avty_t\":\"" +
+            String(MQTT_STATUS) +
+            "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}");
+    publishRetained(
+        c_pidg_number,
+        String("{\"name\":\"PID Guard\",\"uniq_id\":\"") + dev_id +
+            "_pid_guard\",\"cmd_t\":\"" + t_pidg_cmd + "\",\"stat_t\":\"" + t_pidg_state +
+            "\",\"min\":0,\"max\":100,\"step\":0.5,\"mode\":\"auto\",\"avty_t\":\"" +
+            String(MQTT_STATUS) +
+            "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}");
+
     // --- sensor mirrors (read-only) for verification ---
     publishRetained(c_brewset_sensor,
                     String("{\"name\":\"Brew Setpoint (Sensor)\",\"uniq_id\":\"") + dev_id +
@@ -670,6 +757,10 @@ static void publishStates() {
     publishNum(t_curtemp_state, currentTemp, 1);
     publishNum(t_press_state, lastPress, 1);
     publishNum(t_shottime_state, shotTime, 1);  // seconds
+    // diagnostics
+    publishNum(t_accnt_state, acCount, 0);
+    publishNum(t_zccnt_state, zcCount, 0);
+    publishNum(t_pulsecnt_state, pulseCount, 0);
 
     // flags
     publishBool(t_shot_state, shotFlag);
@@ -679,6 +770,11 @@ static void publishStates() {
     // number entity states (retained so HA persists)
     publishNum(t_brewset_state, brewSetpoint, 1, true);
     publishNum(t_steamset_state, steamSetpoint, 1, true);
+    // PID number states
+    publishNum(t_pidp_state, pGainTemp, 2, true);
+    publishNum(t_pidi_state, iGainTemp, 2, true);
+    publishNum(t_pidd_state, dGainTemp, 2, true);
+    publishNum(t_pidg_state, windupGuardTemp, 2, true);
 
     // sensor mirrors (verification)
     publishNum(t_brewset_sensor_state, brewSetpoint, 1);
@@ -706,6 +802,28 @@ static void mqttCallback(char* topic, uint8_t* payload, unsigned int len) {
     if (parse_clamped(t_steamset_cmd, STEAM_MIN_C, STEAM_MAX_C, steamSetpoint)) {
         changed = true;
         LOG("HA: Steam setpoint -> %.1f °C", steamSetpoint);
+    }
+    // PID params
+    float tmp;
+    if (parse_clamped(t_pidp_cmd, 0.0f, 200.0f, tmp)) {
+        pGainTemp = tmp;
+        publishNum(t_pidp_state, pGainTemp, 2, true);
+        LOG("HA: PID P -> %.2f", pGainTemp);
+    }
+    if (parse_clamped(t_pidi_cmd, 0.0f, 10.0f, tmp)) {
+        iGainTemp = tmp;
+        publishNum(t_pidi_state, iGainTemp, 2, true);
+        LOG("HA: PID I -> %.2f", iGainTemp);
+    }
+    if (parse_clamped(t_pidd_cmd, 0.0f, 500.0f, tmp)) {
+        dGainTemp = tmp;
+        publishNum(t_pidd_state, dGainTemp, 2, true);
+        LOG("HA: PID D -> %.2f", dGainTemp);
+    }
+    if (parse_clamped(t_pidg_cmd, 0.0f, 100.0f, tmp)) {
+        windupGuardTemp = tmp;
+        publishNum(t_pidg_state, windupGuardTemp, 2, true);
+        LOG("HA: PID Guard -> %.2f", windupGuardTemp);
     }
     if (changed) {
         if (!steamFlag) setTemp = brewSetpoint;  // if brewing, apply immediately
@@ -760,6 +878,11 @@ static void ensureMqtt() {
             publishDiscovery();
             mqttClient.subscribe(t_brewset_cmd);
             mqttClient.subscribe(t_steamset_cmd);
+            // PID control subscriptions
+            mqttClient.subscribe(t_pidp_cmd);
+            mqttClient.subscribe(t_pidi_cmd);
+            mqttClient.subscribe(t_pidd_cmd);
+            mqttClient.subscribe(t_pidg_cmd);
         }
         lastConn = true;
         return;
