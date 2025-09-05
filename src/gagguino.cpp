@@ -25,7 +25,7 @@ static inline void LOG(const char* fmt, ...) {
 }
 
 namespace {
-constexpr int FLOW_PIN = 26, ZC_PIN = 25, HEAT_PIN = 27, AC_SENS = 14;
+constexpr int FLOW_PIN = 26, ZC_PIN = 25, HEAT_PIN = 27, AC_SENS = 14, TRIAC_PIN = 17;
 constexpr int MAX_CS = 16;
 constexpr int PRESS_PIN = 35;
 
@@ -58,6 +58,11 @@ constexpr unsigned long AC_WAIT = 100;
 constexpr int STEAM_MIN = 20;
 
 const bool streamData = true, debugPrint = true;
+// TRIAC dimmer control (RobotDyn module)
+constexpr bool TRIAC_ENABLED = true;  // set to true if using dimmer module
+constexpr int MAINS_HZ = 50;          // 50 or 60
+constexpr unsigned long HALF_CYCLE_US = (1000000UL / (2 * MAINS_HZ));
+constexpr unsigned int TRIAC_PULSE_US = 120;  // microseconds
 }  // namespace
 
 // ---------- Devices / globals ----------
@@ -78,6 +83,15 @@ float pGainTemp = P_GAIN_TEMP, iGainTemp = I_GAIN_TEMP, dGainTemp = D_GAIN_TEMP,
 int heatCycles = 0;
 bool heaterState = false;
 bool heaterEnabled = true;  // HA switch default ON at boot
+// TRIAC: manual pump power percentage 0..100, controlled via HA number
+float pumpPowerPct = 0.0f;
+// TRIAC scheduling state
+volatile unsigned long lastZcMicros = 0;
+volatile bool zcFlagTriac = false;
+bool triacPulsePending = false;
+bool triacPulseOn = false;
+unsigned long triacFireTimeUs = 0;
+unsigned long triacPulseEndUs = 0;
 
 // Pressure
 int rawPress = 0;
@@ -125,6 +139,8 @@ char t_shotvol_state[96], t_settemp_state[96], t_curtemp_state[96], t_press_stat
     t_shottime_state[96], t_ota_state[96];
 // Switch state/command topics
 char t_heater_state[96], t_heater_cmd[96];
+// TRIAC pump power number topics
+char t_pumppower_state[96], t_pumppower_cmd[96];
 // Diagnostics state topics
 char t_accnt_state[96], t_zccnt_state[96], t_pulsecnt_state[96];
 // Binary sensor state topics
@@ -149,6 +165,8 @@ char c_brewset_number[128], c_steamset_number[128];
 char c_brewset_sensor[128], c_steamset_sensor[128];
 // Switch config
 char c_heater[128];
+// TRIAC pump power number config
+char c_pumppower_number[128];
 
 // ---------- helpers ----------
 static inline const char* wifiStatusName(wl_status_t s) {
@@ -244,6 +262,7 @@ static void ensureOta() {
         otaActive = true;  // signal loop to reduce load and suppress MQTT publishing
         // Turn off heater to reduce power/noise during OTA
         digitalWrite(HEAT_PIN, LOW);
+        digitalWrite(TRIAC_PIN, LOW);
         heaterState = false;
     });
     ArduinoOTA.onEnd([]() {
@@ -473,6 +492,47 @@ static void updateVols() {
     shotVol = (preFlow || !shotFlag) ? 0 : (vol - preFlowVol);
 }
 
+// TRIAC dimmer control (Pump): schedule and fire gate pulses after zero-cross
+static void updateTriacControl() {
+    if (!TRIAC_ENABLED) return;
+    // Disable TRIAC during OTA to keep WiFi responsive
+    if (otaActive) {
+        digitalWrite(TRIAC_PIN, LOW);
+        triacPulsePending = false;
+        triacPulseOn = false;
+        return;
+    }
+    // New zero-cross detected: compute delay based on desired power
+    if (zcFlagTriac) {
+        zcFlagTriac = false;
+        float pct = pumpPowerPct;
+        if (pct <= 0.0f) {
+            triacPulsePending = false;
+            triacPulseOn = false;
+            digitalWrite(TRIAC_PIN, LOW);
+        } else if (pct >= 100.0f) {
+            // Fire almost immediately after ZC
+            triacFireTimeUs = lastZcMicros + 50;  // small fixed delay
+            triacPulsePending = true;
+        } else {
+            unsigned long delayUs = (unsigned long)((100.0f - pct) * 0.01f * (float)HALF_CYCLE_US);
+            triacFireTimeUs = lastZcMicros + delayUs;
+            triacPulsePending = true;
+        }
+    }
+    unsigned long nowUs = micros();
+    if (triacPulsePending && ((long)(nowUs - triacFireTimeUs) >= 0)) {
+        digitalWrite(TRIAC_PIN, HIGH);
+        triacPulseOn = true;
+        triacPulseEndUs = nowUs + TRIAC_PULSE_US;
+        triacPulsePending = false;
+    }
+    if (triacPulseOn && ((long)(micros() - triacPulseEndUs) >= 0)) {
+        digitalWrite(TRIAC_PIN, LOW);
+        triacPulseOn = false;
+    }
+}
+
 // ISRs
 static void IRAM_ATTR flowInt() {
     unsigned long now = millis();
@@ -484,6 +544,9 @@ static void IRAM_ATTR flowInt() {
 static void IRAM_ATTR zcInt() {
     lastZcTime = millis();
     zcCount++;
+    // TRIAC phase control timing (use micros for precision)
+    lastZcMicros = micros();
+    zcFlagTriac = true;
 }
 
 // ---------- HA Discovery helpers ----------
@@ -506,6 +569,11 @@ static void buildTopics() {
     snprintf(t_shottime_state, sizeof(t_shottime_state), "%s/%s/shot_time/state", STATE_BASE,
              uid_suffix);
     snprintf(t_ota_state, sizeof(t_ota_state), "%s/%s/ota/status", STATE_BASE, uid_suffix);
+    // TRIAC power number topics (pump power)
+    snprintf(t_pumppower_state, sizeof(t_pumppower_state), "%s/%s/pump_power/state", STATE_BASE,
+             uid_suffix);
+    snprintf(t_pumppower_cmd, sizeof(t_pumppower_cmd), "%s/%s/pump_power/set", STATE_BASE,
+             uid_suffix);
     // heater switch topics
     snprintf(t_heater_state, sizeof(t_heater_state), "%s/%s/heater/state", STATE_BASE, uid_suffix);
     snprintf(t_heater_cmd, sizeof(t_heater_cmd), "%s/%s/heater/set", STATE_BASE, uid_suffix);
@@ -585,6 +653,9 @@ static void buildTopics() {
     snprintf(c_pulsecnt, sizeof(c_pulsecnt), "%s/sensor/%s_pulse_count/config", DISCOVERY_PREFIX, dev_id);
     // switch
     snprintf(c_heater, sizeof(c_heater), "%s/switch/%s_heater/config", DISCOVERY_PREFIX, dev_id);
+    // TRIAC power number (pump power)
+    snprintf(c_pumppower_number, sizeof(c_pumppower_number), "%s/number/%s_pump_power/config",
+             DISCOVERY_PREFIX, dev_id);
 }
 
 static String deviceJson() {
@@ -705,6 +776,17 @@ static void publishDiscovery() {
             "\",\"pl_on\":\"ON\",\"pl_off\":\"OFF\",\"avty_t\":\"" + String(MQTT_STATUS) +
             "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}");
 
+    // --- number: pump power (TRIAC) ---
+        publishRetained(
+            c_pumppower_number,
+            String("{\"name\":\"Pump Power\",\"uniq_id\":\"") + dev_id +
+            "_pump_power\",\"cmd_t\":\"" + t_pumppower_cmd + "\",\"stat_t\":\"" +
+            t_pumppower_state +
+            "\",\"unit_of_meas\":\"%\",\"min\":0,\"max\":100,\"step\":1,\"mode\":\"auto\",\"avty_t\":\"" +
+            String(MQTT_STATUS) +
+            "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"entity_category\":\"config\",\"dev\":" +
+            dev + "}");
+
     // --- numbers (controllable) ---
     publishRetained(
         c_brewset_number,
@@ -798,6 +880,8 @@ static void publishStates() {
     publishNum(t_shottime_state, shotTime, 1);  // seconds
     // heater switch state (retained so HA keeps last state)
     publishBool(t_heater_state, heaterEnabled, true);
+    // Pump power state (TRIAC, retained)
+    publishNum(t_pumppower_state, pumpPowerPct, 0, true);
     // diagnostics
     publishNum(t_accnt_state, acCount, 0);
     publishNum(t_zccnt_state, zcCount, 0);
@@ -882,6 +966,12 @@ static void mqttCallback(char* topic, uint8_t* payload, unsigned int len) {
         publishNum(t_pidg_state, windupGuardTemp, 2, true);
         LOG("HA: PID Guard -> %.2f", windupGuardTemp);
     }
+    // TRIAC pump power (0..100)
+    if (parse_clamped(t_pumppower_cmd, 0.0f, 100.0f, tmp)) {
+        pumpPowerPct = tmp;
+        publishNum(t_pumppower_state, pumpPowerPct, 0, true);
+        LOG("HA: Pump Power -> %.0f%%", pumpPowerPct);
+    }
     // heater switch
     bool hv;
     if (parse_onoff(t_heater_cmd, hv)) {
@@ -959,6 +1049,8 @@ static void ensureMqtt() {
             mqttClient.subscribe(t_pidg_cmd);
             // heater switch
             mqttClient.subscribe(t_heater_cmd);
+            // TRIAC pump power control
+            mqttClient.subscribe(t_pumppower_cmd);
         }
         lastConn = true;
         return;
@@ -1000,11 +1092,13 @@ void setup() {
 
     pinMode(MAX_CS, OUTPUT);
     pinMode(HEAT_PIN, OUTPUT);
+    pinMode(TRIAC_PIN, OUTPUT);
     pinMode(PRESS_PIN, INPUT);
     pinMode(FLOW_PIN, INPUT_PULLUP);
     pinMode(ZC_PIN, INPUT);
     pinMode(AC_SENS, INPUT_PULLUP);
     digitalWrite(HEAT_PIN, LOW);
+    digitalWrite(TRIAC_PIN, LOW);
     heaterState = false;
 
     debugReadMAX31865();
@@ -1050,13 +1144,13 @@ void loop() {
 
     // During OTA, minimize work to keep WiFi/TCP responsive
     if (!otaActive) {
-        checkShotStartStop();
-        if (currentTime - lastPidTime >= PID_CYCLE) updateTempPID();
-        updateTempPWM();
-        updatePressure();
-        updatePreFlow();
-        updateVols();
-        updateSteamFlag();
+    checkShotStartStop();
+    if (currentTime - lastPidTime >= PID_CYCLE) updateTempPID();
+    updateTempPWM();
+    updatePressure();
+    updatePreFlow();
+    updateVols();
+    updateSteamFlag();
     }
 
     // Update shot time continuously while shot is active (seconds)
@@ -1068,6 +1162,8 @@ void loop() {
     ensureMqtt();
     ensureOta();
     if (WiFi.status() == WL_CONNECTED) ArduinoOTA.handle();
+    // TRIAC control needs frequent checks (after OTA.handle to keep WiFi responsive)
+    if (!otaActive) updateTriacControl();
 
     if (!otaActive && streamData && (currentTime - lastSerialTime) > SER_OUT_CYCLE) {
         if (mqttClient.connected()) publishStates();
