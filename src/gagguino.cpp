@@ -1,3 +1,23 @@
+/**
+ * @file gagguino.cpp
+ * @brief Gagguino firmware: ESP32 control for Gaggia Classic.
+ *
+ * High‑level responsibilities:
+ * - Temperature control using a MAX31865 RTD amplifier (PT100) and PID.
+ * - Heater PWM drive and optional TRIAC phase‑angle dimming for pump control.
+ * - Flow, pressure and shot timing measurement with debounced ISR counters.
+ * - Wi‑Fi + MQTT with Home Assistant discovery for control/telemetry.
+ * - Robust OTA (ArduinoOTA) that throttles other work while an update runs.
+ *
+ * Hardware pins (ESP32 default board mapping):
+ * - FLOW_PIN (26)   : Flow sensor input (interrupt on CHANGE)
+ * - ZC_PIN (25)     : AC zero‑cross detect (interrupt on RISING)
+ * - HEAT_PIN (27)   : Boiler relay/SSR output (PWM windowing)
+ * - AC_SENS (14)    : Steam switch sense (digital input)
+ * - TRIAC_PIN (17)  : TRIAC gate output for pump phase control
+ * - MAX_CS (16)     : MAX31865 SPI chip‑select
+ * - PRESS_PIN (35)  : Analog pressure sensor input
+ */
 #include "gagguino.h"
 
 #include <Adafruit_MAX31865.h>
@@ -15,6 +35,9 @@
 #define STARTUP_WAIT 1000
 #define SERIAL_BAUD 115200
 
+/**
+ * @brief Lightweight printf‑style logger to the serial console.
+ */
 static inline void LOG(const char* fmt, ...) {
     static char buf[192];
     va_list args;
@@ -169,6 +192,9 @@ char c_heater[128];
 char c_pumppower_number[128];
 
 // ---------- helpers ----------
+/**
+ * @brief Convert Wi‑Fi status to a readable string.
+ */
 static inline const char* wifiStatusName(wl_status_t s) {
     switch (s) {
         case WL_IDLE_STATUS:
@@ -189,6 +215,9 @@ static inline const char* wifiStatusName(wl_status_t s) {
             return "UNKNOWN";
     }
 }
+/**
+ * @brief Convert PubSubClient connection state to a readable string.
+ */
 static inline const char* mqttStateName(int8_t s) {
     switch (s) {
         case MQTT_CONNECTION_TIMEOUT:
@@ -216,12 +245,18 @@ static inline const char* mqttStateName(int8_t s) {
     }
 }
 
+/**
+ * @brief Tune MQTT timeouts/buffer to play nicer with OTA pauses.
+ */
 static void initMqttTuning() {
     // Longer keepalive so brief OTA stalls don't drop MQTT
     mqttClient.setKeepAlive(60);
     mqttClient.setSocketTimeout(5);
     mqttClient.setBufferSize(1024);
 }
+/**
+ * @brief Resolve `MQTT_HOST` to an IP once and cache it.
+ */
 static void resolveBrokerIfNeeded() {
     if (g_mqttIpResolved) return;
     if (g_mqttIp.fromString(MQTT_HOST)) {
@@ -241,6 +276,15 @@ static void resolveBrokerIfNeeded() {
 // ---------- OTA ----------
 // Forward declaration for MQTT publish helper used in OTA callbacks
 static void publishStr(const char* topic, const String& v, bool retain = false);
+/**
+ * @brief Initialize ArduinoOTA once Wi‑Fi is connected.
+ *
+ * Notes:
+ * - Hostname is derived from MAC address for stability.
+ * - If `OTA_PASSWORD` or `OTA_PASSWORD_HASH` is defined (via build flags),
+ *   OTA authentication is enforced.
+ * - During OTA, heater and TRIAC outputs are disabled and main work throttled.
+ */
 static void ensureOta() {
     if (otaInitialized || WiFi.status() != WL_CONNECTED) return;
 
@@ -295,6 +339,18 @@ static void ensureOta() {
     LOG("OTA: Ready as %s.local", host);
 }
 
+/**
+ * @brief Minimal PID with integral windup guard and derivative on measurement.
+ * @param p Proportional gain
+ * @param i Integral gain
+ * @param d Derivative gain
+ * @param sp Setpoint (target)
+ * @param pv Process value (measured)
+ * @param lastPv Storage for last measured PV (updated)
+ * @param iSum   Storage for integral accumulator (updated)
+ * @param guard  Absolute limit for iSum contribution (anti‑windup)
+ * @return Control output (unclamped)
+ */
 static float calcPID(float p, float i, float d, float sp, float pv, float& lastPv, float& iSum,
                      float guard) {
     float err = sp - pv;
@@ -315,6 +371,9 @@ static float calcPID(float p, float i, float d, float sp, float pv, float& lastP
 }
 
 // --- MAX31865 deep debug read: proves the analog path ---
+/**
+ * @brief Verbose one‑shot read of MAX31865 for debugging analog chain.
+ */
 static void debugReadMAX31865() {
     // Configure for your wiring (2/3/4 wire)
     max31865.begin(MAX31865_2WIRE);
@@ -358,6 +417,9 @@ static void debugReadMAX31865() {
 }
 
 // --- MAX31865 connectivity check & logging ---
+/**
+ * @brief Check MAX31865 fault/status and log useful diagnostics.
+ */
 static void logMax31865Status() {
     uint8_t f = max31865.readFault();
 
@@ -391,6 +453,9 @@ static void logMax31865Status() {
 }
 
 // --------------- espresso logic ---------------
+/**
+ * @brief Detect shot start/stop based on zero‑cross events and steam transitions.
+ */
 static void checkShotStartStop() {
     if ((zcCount >= ZC_MIN) && !shotFlag && setupComplete &&
         ((currentTime - startTime) > ZC_WAIT)) {
@@ -413,6 +478,9 @@ static void checkShotStartStop() {
     }
 }
 
+/**
+ * @brief Read temperature and update heater PID and window length.
+ */
 static void updateTempPID() {
     currentTemp = max31865.temperature(RNOMINAL, RREF);
     if (currentTemp < 0) currentTemp = lastTemp;
@@ -434,6 +502,9 @@ static void updateTempPID() {
     heatCycles = (int)((100.0f - heatPower) / 100.0f * PWM_CYCLE);
 }
 
+/**
+ * @brief Apply time‑proportioning control to the heater output.
+ */
 static void updateTempPWM() {
     if (!heaterEnabled) {
         digitalWrite(HEAT_PIN, LOW);
@@ -453,6 +524,9 @@ static void updateTempPWM() {
     nLoop++;
 }
 
+/**
+ * @brief Sample pressure ADC and maintain a moving average buffer.
+ */
 static void updatePressure() {
     rawPress = analogRead(PRESS_PIN);
     pressNow = rawPress * pressGrad + pressInt;
@@ -465,6 +539,9 @@ static void updatePressure() {
     lastPress = pressSum / PRESS_BUFF_SIZE;
 }
 
+/**
+ * @brief Infer steam mode based on AC sense and recent zero‑cross activity.
+ */
 static void updateSteamFlag() {
     ac = !digitalRead(AC_SENS);
     prevSteamFlag = steamFlag;
@@ -479,6 +556,9 @@ static void updateSteamFlag() {
     }
 }
 
+/**
+ * @brief Track pre‑infusion phase and capture volume up to threshold pressure.
+ */
 static void updatePreFlow() {
     if (preFlow && lastPress > PRESS_THRESHOLD) {
         preFlow = false;
@@ -486,6 +566,9 @@ static void updatePreFlow() {
     }
 }
 
+/**
+ * @brief Convert pulse counts to volumes and maintain shot volume.
+ */
 static void updateVols() {
     vol = (int)(pulseCount * FLOW_CAL);
     lastVol = vol;
@@ -493,6 +576,12 @@ static void updateVols() {
 }
 
 // TRIAC dimmer control (Pump): schedule and fire gate pulses after zero-cross
+/**
+ * @brief Phase‑angle control for pump TRIAC synchronized to zero‑cross.
+ *
+ * Schedules a short gate pulse at a delay mapped from desired power.
+ * Disabled during OTA to prioritize Wi‑Fi responsiveness.
+ */
 static void updateTriacControl() {
     if (!TRIAC_ENABLED) return;
     // Disable TRIAC during OTA to keep WiFi responsive
@@ -534,6 +623,9 @@ static void updateTriacControl() {
 }
 
 // ISRs
+/**
+ * @brief Flow sensor ISR with simple debounce using `PULSE_MIN`.
+ */
 static void IRAM_ATTR flowInt() {
     unsigned long now = millis();
     if (now - lastPulseTime >= PULSE_MIN) {
@@ -541,6 +633,9 @@ static void IRAM_ATTR flowInt() {
         lastPulseTime = now;
     }
 }
+/**
+ * @brief Zero‑cross detect ISR: records timing and triggers TRIAC scheduling.
+ */
 static void IRAM_ATTR zcInt() {
     lastZcTime = millis();
     zcCount++;
@@ -550,6 +645,9 @@ static void IRAM_ATTR zcInt() {
 }
 
 // ---------- HA Discovery helpers ----------
+/**
+ * @brief Build stable device identifiers from the MAC address.
+ */
 static void makeIdsFromMac() {
     uint8_t mac[6];
     WiFi.macAddress(mac);
@@ -557,6 +655,9 @@ static void makeIdsFromMac() {
     snprintf(dev_id, sizeof(dev_id), "gaggia_classic-%s", uid_suffix);
 }
 
+/**
+ * @brief Construct MQTT topics for state, commands and discovery.
+ */
 static void buildTopics() {
     // sensor states
     snprintf(t_shotvol_state, sizeof(t_shotvol_state), "%s/%s/shot_volume/state", STATE_BASE,
@@ -658,6 +759,9 @@ static void buildTopics() {
              DISCOVERY_PREFIX, dev_id);
 }
 
+/**
+ * @brief JSON snippet describing the device for HA discovery payloads.
+ */
 static String deviceJson() {
     String j = "{";
     j += "\"identifiers\":[\"" + String(dev_id) + "\"],";
@@ -667,11 +771,17 @@ static String deviceJson() {
     return j;
 }
 
+/**
+ * @brief Publish a retained discovery/config message.
+ */
 static void publishRetained(const char* topic, const String& payload) {
     if (!mqttClient.publish(topic, payload.c_str(), true))
         LOG("MQTT: discovery publish failed (%s)", topic);
 }
 
+/**
+ * @brief Publish Home Assistant discovery entities (sensors, numbers, switch).
+ */
 static void publishDiscovery() {
     String dev = deviceJson();
 
@@ -858,10 +968,16 @@ static void publishDiscovery() {
 }
 
 // ---------- publishing states ----------
+/**
+ * @brief Publish a string value to MQTT.
+ */
 static void publishStr(const char* topic, const String& v, bool retain) {
     if (!mqttClient.publish(topic, v.c_str(), retain))
         LOG("MQTT: state publish failed (%s) val=%s", topic, v.c_str());
 }
+/**
+ * @brief Publish a floating‑point value with fixed decimals.
+ */
 static void publishNum(const char* topic, float v, uint8_t decimals = 1, bool retain = false) {
     char tmp[24];
     dtostrf(v, 0, decimals, tmp);
@@ -871,6 +987,9 @@ static void publishBool(const char* topic, bool on, bool retain = false) {
     publishStr(topic, on ? "ON" : "OFF", retain);
 }
 
+/**
+ * @brief Publish periodic telemetry and mirrored setpoint values.
+ */
 static void publishStates() {
     // measurements
     publishNum(t_shotvol_state, shotVol, 0);  // mL
@@ -907,6 +1026,9 @@ static void publishStates() {
 }
 
 // ---------- MQTT callback (handle both setpoints) ----------
+/**
+ * @brief Handle inbound MQTT commands (setpoints, PID gains, pump power, switch).
+ */
 static void mqttCallback(char* topic, uint8_t* payload, unsigned int len) {
     auto parse_clamped = [&](const char* t, float lo, float hi, float& outVal) -> bool {
         if (strcmp(topic, t) != 0) return false;
@@ -997,6 +1119,9 @@ static void mqttCallback(char* topic, uint8_t* payload, unsigned int len) {
 }
 
 // ---------- WiFi / MQTT ----------
+/**
+ * @brief Maintain Wi‑Fi connection with periodic reconnect attempts.
+ */
 static void ensureWifi() {
     wl_status_t now = WiFi.status();
     static wl_status_t last = (wl_status_t)255;
@@ -1021,6 +1146,9 @@ static void ensureWifi() {
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 }
 
+/**
+ * @brief Maintain MQTT session, (re)publish discovery and subscribe to commands.
+ */
 static void ensureMqtt() {
     mqttClient.loop();
     if (otaActive) {
@@ -1080,6 +1208,9 @@ static void ensureMqtt() {
 
 namespace gag {
 
+/**
+ * @copydoc gag::setup()
+ */
 void setup() {
     Serial.begin(SERIAL_BAUD);
     delay(300);
@@ -1139,6 +1270,9 @@ void setup() {
         MQTT_CLIENTID);
 }
 
+/**
+ * @copydoc gag::loop()
+ */
 void loop() {
     currentTime = millis();
 
