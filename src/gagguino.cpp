@@ -1086,7 +1086,8 @@ static void ensureWifi() {
 
     if (connecting) {
         // Wait briefly for connection result while yielding to other tasks
-        wl_status_t res = WiFi.waitForConnectResult(100);
+        wl_status_t res = static_cast<wl_status_t>(WiFi.waitForConnectResult(100));
+
         if (res == WL_CONNECTED) {
             connecting = false;
         } else if (millis() - connectStart > 10000) {
