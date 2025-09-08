@@ -22,12 +22,12 @@
 
 #include <Adafruit_MAX31865.h>
 #include <Arduino.h>
+#include <ArduinoOTA.h>
 #include <PubSubClient.h>
 #include <WiFi.h>
-#include <ArduinoOTA.h>
+#include <ctype.h>
 
 #include <cstdarg>
-#include <ctype.h>
 
 #include "secrets.h"  // WIFI_*, MQTT_*
 
@@ -53,8 +53,8 @@ constexpr int MAX_CS = 16;
 constexpr int PRESS_PIN = 35;
 
 constexpr unsigned long PRESS_CYCLE = 100, PID_CYCLE = 500, PWM_CYCLE = 500, LOG_CYCLE = 2000;
-constexpr unsigned long MQTT_IDLE_CYCLE = 10000;  // ms between publishes when idle
-constexpr unsigned long MQTT_SHOT_CYCLE = 1000;   // ms between publishes during a shot
+constexpr unsigned long MQTT_IDLE_CYCLE = 2000;  // ms between publishes when idle
+constexpr unsigned long MQTT_SHOT_CYCLE = 500;   // ms between publishes during a shot
 
 // Brew & Steam setpoint limits
 constexpr float BREW_MIN = 90.0f, BREW_MAX = 99.0f;
@@ -325,11 +325,21 @@ static void ensureOta() {
     ArduinoOTA.onError([](ota_error_t error) {
         const char* msg = "UNKNOWN";
         switch (error) {
-            case OTA_AUTH_ERROR: msg = "AUTH"; break;
-            case OTA_BEGIN_ERROR: msg = "BEGIN"; break;
-            case OTA_CONNECT_ERROR: msg = "CONNECT"; break;
-            case OTA_RECEIVE_ERROR: msg = "RECEIVE"; break;
-            case OTA_END_ERROR: msg = "END"; break;
+            case OTA_AUTH_ERROR:
+                msg = "AUTH";
+                break;
+            case OTA_BEGIN_ERROR:
+                msg = "BEGIN";
+                break;
+            case OTA_CONNECT_ERROR:
+                msg = "CONNECT";
+                break;
+            case OTA_RECEIVE_ERROR:
+                msg = "RECEIVE";
+                break;
+            case OTA_END_ERROR:
+                msg = "END";
+                break;
         }
         LOG("OTA: Error %d (%s)", (int)error, msg);
         otaActive = false;
@@ -496,8 +506,8 @@ static void updateTempPID() {
     // Active target picks between brew and steam setpoints
     setTemp = steamFlag ? steamSetpoint : brewSetpoint;
 
-    heatPower = calcPID(pGainTemp, iGainTemp, dGainTemp, setTemp, currentTemp, lastTemp,
-                        iStateTemp, windupGuardTemp);
+    heatPower = calcPID(pGainTemp, iGainTemp, dGainTemp, setTemp, currentTemp, lastTemp, iStateTemp,
+                        windupGuardTemp);
     if (heatPower > 100.0f) heatPower = 100.0f;
     if (heatPower < 0.0f) heatPower = 0.0f;
     heatCycles = (int)((100.0f - heatPower) / 100.0f * PWM_CYCLE);
@@ -680,10 +690,8 @@ static void buildTopics() {
     snprintf(t_heater_state, sizeof(t_heater_state), "%s/%s/heater/state", STATE_BASE, uid_suffix);
     snprintf(t_heater_cmd, sizeof(t_heater_cmd), "%s/%s/heater/set", STATE_BASE, uid_suffix);
     // diagnostic counters states
-    snprintf(t_accnt_state, sizeof(t_accnt_state), "%s/%s/ac_count/state", STATE_BASE,
-             uid_suffix);
-    snprintf(t_zccnt_state, sizeof(t_zccnt_state), "%s/%s/zc_count/state", STATE_BASE,
-             uid_suffix);
+    snprintf(t_accnt_state, sizeof(t_accnt_state), "%s/%s/ac_count/state", STATE_BASE, uid_suffix);
+    snprintf(t_zccnt_state, sizeof(t_zccnt_state), "%s/%s/zc_count/state", STATE_BASE, uid_suffix);
     snprintf(t_pulsecnt_state, sizeof(t_pulsecnt_state), "%s/%s/pulse_count/state", STATE_BASE,
              uid_suffix);
     // binary sensor states
@@ -739,10 +747,14 @@ static void buildTopics() {
     snprintf(c_steamset_number, sizeof(c_steamset_number), "%s/number/%s_steam_setpoint/config",
              DISCOVERY_PREFIX, dev_id);
     // PID numbers
-    snprintf(c_pidp_number, sizeof(c_pidp_number), "%s/number/%s_pid_p/config", DISCOVERY_PREFIX, dev_id);
-    snprintf(c_pidi_number, sizeof(c_pidi_number), "%s/number/%s_pid_i/config", DISCOVERY_PREFIX, dev_id);
-    snprintf(c_pidd_number, sizeof(c_pidd_number), "%s/number/%s_pid_d/config", DISCOVERY_PREFIX, dev_id);
-    snprintf(c_pidg_number, sizeof(c_pidg_number), "%s/number/%s_pid_guard/config", DISCOVERY_PREFIX, dev_id);
+    snprintf(c_pidp_number, sizeof(c_pidp_number), "%s/number/%s_pid_p/config", DISCOVERY_PREFIX,
+             dev_id);
+    snprintf(c_pidi_number, sizeof(c_pidi_number), "%s/number/%s_pid_i/config", DISCOVERY_PREFIX,
+             dev_id);
+    snprintf(c_pidd_number, sizeof(c_pidd_number), "%s/number/%s_pid_d/config", DISCOVERY_PREFIX,
+             dev_id);
+    snprintf(c_pidg_number, sizeof(c_pidg_number), "%s/number/%s_pid_guard/config",
+             DISCOVERY_PREFIX, dev_id);
 
     // sensor mirrors for setpoints
     snprintf(c_brewset_sensor, sizeof(c_brewset_sensor), "%s/sensor/%s_brew_setpoint/config",
@@ -752,7 +764,8 @@ static void buildTopics() {
     // diagnostic sensors
     snprintf(c_accnt, sizeof(c_accnt), "%s/sensor/%s_ac_count/config", DISCOVERY_PREFIX, dev_id);
     snprintf(c_zccnt, sizeof(c_zccnt), "%s/sensor/%s_zc_count/config", DISCOVERY_PREFIX, dev_id);
-    snprintf(c_pulsecnt, sizeof(c_pulsecnt), "%s/sensor/%s_pulse_count/config", DISCOVERY_PREFIX, dev_id);
+    snprintf(c_pulsecnt, sizeof(c_pulsecnt), "%s/sensor/%s_pulse_count/config", DISCOVERY_PREFIX,
+             dev_id);
     // switch
     snprintf(c_heater, sizeof(c_heater), "%s/switch/%s_heater/config", DISCOVERY_PREFIX, dev_id);
     // TRIAC power number (pump power)
@@ -829,33 +842,34 @@ static void publishDiscovery() {
                         "}");
 
     // OTA status (diagnostic sensor)
-    publishRetained(c_ota,
-                    String("{\"name\":\"OTA Status\",\"uniq_id\":\"") + dev_id +
-                        "_ota_status\",\"stat_t\":\"" + t_ota_state +
-                        "\",\"entity_category\":\"diagnostic\",\"avty_t\":\"" +
-                        String(MQTT_STATUS) +
-                        "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev +
-                        "}");
+    publishRetained(
+        c_ota, String("{\"name\":\"OTA Status\",\"uniq_id\":\"") + dev_id +
+                   "_ota_status\",\"stat_t\":\"" + t_ota_state +
+                   "\",\"entity_category\":\"diagnostic\",\"avty_t\":\"" + String(MQTT_STATUS) +
+                   "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}");
 
     // Diagnostic counters
-    publishRetained(c_accnt,
-                    String("{\"name\":\"AC Count\",\"uniq_id\":\"") + dev_id +
-                        "_ac_count\",\"stat_t\":\"" + t_accnt_state +
-                        "\",\"stat_cla\":\"measurement\",\"entity_category\":\"diagnostic\",\"avty_t\":\"" +
-                        String(MQTT_STATUS) +
-                        "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}");
-    publishRetained(c_zccnt,
-                    String("{\"name\":\"ZC Count\",\"uniq_id\":\"") + dev_id +
-                        "_zc_count\",\"stat_t\":\"" + t_zccnt_state +
-                        "\",\"stat_cla\":\"measurement\",\"entity_category\":\"diagnostic\",\"avty_t\":\"" +
-                        String(MQTT_STATUS) +
-                        "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}");
-    publishRetained(c_pulsecnt,
-                    String("{\"name\":\"Pulse Count\",\"uniq_id\":\"") + dev_id +
-                        "_pulse_count\",\"stat_t\":\"" + t_pulsecnt_state +
-                        "\",\"stat_cla\":\"measurement\",\"entity_category\":\"diagnostic\",\"avty_t\":\"" +
-                        String(MQTT_STATUS) +
-                        "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}");
+    publishRetained(
+        c_accnt,
+        String("{\"name\":\"AC Count\",\"uniq_id\":\"") + dev_id + "_ac_count\",\"stat_t\":\"" +
+            t_accnt_state +
+            "\",\"stat_cla\":\"measurement\",\"entity_category\":\"diagnostic\",\"avty_t\":\"" +
+            String(MQTT_STATUS) +
+            "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}");
+    publishRetained(
+        c_zccnt,
+        String("{\"name\":\"ZC Count\",\"uniq_id\":\"") + dev_id + "_zc_count\",\"stat_t\":\"" +
+            t_zccnt_state +
+            "\",\"stat_cla\":\"measurement\",\"entity_category\":\"diagnostic\",\"avty_t\":\"" +
+            String(MQTT_STATUS) +
+            "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}");
+    publishRetained(
+        c_pulsecnt,
+        String("{\"name\":\"Pulse Count\",\"uniq_id\":\"") + dev_id +
+            "_pulse_count\",\"stat_t\":\"" + t_pulsecnt_state +
+            "\",\"stat_cla\":\"measurement\",\"entity_category\":\"diagnostic\",\"avty_t\":\"" +
+            String(MQTT_STATUS) +
+            "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}");
 
     // --- binary sensors ---
     publishRetained(
@@ -882,21 +896,21 @@ static void publishDiscovery() {
     // --- switch: heater enable ---
     publishRetained(
         c_heater,
-        String("{\"name\":\"Heater\",\"uniq_id\":\"") + dev_id +
-            "_heater\",\"cmd_t\":\"" + t_heater_cmd + "\",\"stat_t\":\"" + t_heater_state +
+        String("{\"name\":\"Heater\",\"uniq_id\":\"") + dev_id + "_heater\",\"cmd_t\":\"" +
+            t_heater_cmd + "\",\"stat_t\":\"" + t_heater_state +
             "\",\"pl_on\":\"ON\",\"pl_off\":\"OFF\",\"avty_t\":\"" + String(MQTT_STATUS) +
             "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}");
 
     // --- number: pump power (TRIAC) ---
-        publishRetained(
-            c_pumppower_number,
-            String("{\"name\":\"Pump Power\",\"uniq_id\":\"") + dev_id +
-            "_pump_power\",\"cmd_t\":\"" + t_pumppower_cmd + "\",\"stat_t\":\"" +
-            t_pumppower_state +
-            "\",\"unit_of_meas\":\"%\",\"min\":0,\"max\":100,\"step\":1,\"mode\":\"auto\",\"avty_t\":\"" +
-            String(MQTT_STATUS) +
-            "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"entity_category\":\"config\",\"dev\":" +
-            dev + "}");
+    publishRetained(c_pumppower_number, String("{\"name\":\"Pump Power\",\"uniq_id\":\"") + dev_id +
+                                            "_pump_power\",\"cmd_t\":\"" + t_pumppower_cmd +
+                                            "\",\"stat_t\":\"" + t_pumppower_state +
+                                            "\",\"unit_of_meas\":\"%\",\"min\":0,\"max\":100,"
+                                            "\"step\":1,\"mode\":\"auto\",\"avty_t\":\"" +
+                                            String(MQTT_STATUS) +
+                                            "\",\"pl_avail\":\"online\",\"pl_not_avail\":"
+                                            "\"offline\",\"entity_category\":\"config\",\"dev\":" +
+                                            dev + "}");
 
     // --- numbers (controllable) ---
     publishRetained(
@@ -919,31 +933,31 @@ static void publishDiscovery() {
                         "}");
 
     // PID number entities
-    publishRetained(
-        c_pidp_number,
-        String("{\"name\":\"PID P\",\"uniq_id\":\"") + dev_id +
-            "_pid_p\",\"cmd_t\":\"" + t_pidp_cmd + "\",\"stat_t\":\"" + t_pidp_state +
-            "\",\"min\":0,\"max\":200,\"step\":0.1,\"mode\":\"auto\",\"avty_t\":\"" +
-            String(MQTT_STATUS) +
-            "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}");
-    publishRetained(
-        c_pidi_number,
-        String("{\"name\":\"PID I\",\"uniq_id\":\"") + dev_id +
-            "_pid_i\",\"cmd_t\":\"" + t_pidi_cmd + "\",\"stat_t\":\"" + t_pidi_state +
-            "\",\"min\":0,\"max\":10,\"step\":0.05,\"mode\":\"auto\",\"avty_t\":\"" +
-            String(MQTT_STATUS) +
-            "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}");
-    publishRetained(
-        c_pidd_number,
-        String("{\"name\":\"PID D\",\"uniq_id\":\"") + dev_id +
-            "_pid_d\",\"cmd_t\":\"" + t_pidd_cmd + "\",\"stat_t\":\"" + t_pidd_state +
-            "\",\"min\":0,\"max\":500,\"step\":0.5,\"mode\":\"auto\",\"avty_t\":\"" +
-            String(MQTT_STATUS) +
-            "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}");
+    publishRetained(c_pidp_number,
+                    String("{\"name\":\"PID P\",\"uniq_id\":\"") + dev_id +
+                        "_pid_p\",\"cmd_t\":\"" + t_pidp_cmd + "\",\"stat_t\":\"" + t_pidp_state +
+                        "\",\"min\":0,\"max\":200,\"step\":0.1,\"mode\":\"auto\",\"avty_t\":\"" +
+                        String(MQTT_STATUS) +
+                        "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev +
+                        "}");
+    publishRetained(c_pidi_number,
+                    String("{\"name\":\"PID I\",\"uniq_id\":\"") + dev_id +
+                        "_pid_i\",\"cmd_t\":\"" + t_pidi_cmd + "\",\"stat_t\":\"" + t_pidi_state +
+                        "\",\"min\":0,\"max\":10,\"step\":0.05,\"mode\":\"auto\",\"avty_t\":\"" +
+                        String(MQTT_STATUS) +
+                        "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev +
+                        "}");
+    publishRetained(c_pidd_number,
+                    String("{\"name\":\"PID D\",\"uniq_id\":\"") + dev_id +
+                        "_pid_d\",\"cmd_t\":\"" + t_pidd_cmd + "\",\"stat_t\":\"" + t_pidd_state +
+                        "\",\"min\":0,\"max\":500,\"step\":0.5,\"mode\":\"auto\",\"avty_t\":\"" +
+                        String(MQTT_STATUS) +
+                        "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev +
+                        "}");
     publishRetained(
         c_pidg_number,
-        String("{\"name\":\"PID Guard\",\"uniq_id\":\"") + dev_id +
-            "_pid_guard\",\"cmd_t\":\"" + t_pidg_cmd + "\",\"stat_t\":\"" + t_pidg_state +
+        String("{\"name\":\"PID Guard\",\"uniq_id\":\"") + dev_id + "_pid_guard\",\"cmd_t\":\"" +
+            t_pidg_cmd + "\",\"stat_t\":\"" + t_pidg_state +
             "\",\"min\":0,\"max\":100,\"step\":0.5,\"mode\":\"auto\",\"avty_t\":\"" +
             String(MQTT_STATUS) +
             "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}");
@@ -1265,8 +1279,8 @@ void setup() {
     initMqttTuning();
     resolveBrokerIfNeeded();
 
-    LOG("Pins: FLOW=%d ZC=%d HEAT=%d AC_SENS=%d PRESS=%d  SPI{CS=%d}",
-        FLOW_PIN, ZC_PIN, HEAT_PIN, AC_SENS, PRESS_PIN, MAX_CS);
+    LOG("Pins: FLOW=%d ZC=%d HEAT=%d AC_SENS=%d PRESS=%d  SPI{CS=%d}", FLOW_PIN, ZC_PIN, HEAT_PIN,
+        AC_SENS, PRESS_PIN, MAX_CS);
     LOG("WiFi: connecting to '%s'…  MQTT: %s:%u id=%s", WIFI_SSID, MQTT_HOST, MQTT_PORT,
         MQTT_CLIENTID);
 }
@@ -1279,13 +1293,13 @@ void loop() {
 
     // During OTA, minimize work to keep WiFi/TCP responsive
     if (!otaActive) {
-    checkShotStartStop();
-    if (currentTime - lastPidTime >= PID_CYCLE) updateTempPID();
-    updateTempPWM();
-    updatePressure();
-    updatePreFlow();
-    updateVols();
-    updateSteamFlag();
+        checkShotStartStop();
+        if (currentTime - lastPidTime >= PID_CYCLE) updateTempPID();
+        updateTempPWM();
+        updatePressure();
+        updatePreFlow();
+        updateVols();
+        updateSteamFlag();
     }
 
     // Update shot time continuously while shot is active (seconds)
@@ -1306,10 +1320,11 @@ void loop() {
         lastMqttTime = currentTime;
     }
 
-    if (!otaActive && debugPrint && (currentTime - lastLogTime) > LOG_CYCLE) { /* optional debug printing */
+    if (!otaActive && debugPrint &&
+        (currentTime - lastLogTime) > LOG_CYCLE) { /* optional debug printing */
         LOG("Pressure: Raw=%d, Now=%0.2f Last=%0.2f", rawPress, pressNow, lastPress);
-        LOG("Temp: Set=%0.1f, Current=%0.2f", setTemp, currentTemp);        
-        LOG("Heat: Power=%0.1f, Cycles=%d",heatPower, heatCycles);     
+        LOG("Temp: Set=%0.1f, Current=%0.2f", setTemp, currentTemp);
+        LOG("Heat: Power=%0.1f, Cycles=%d", heatPower, heatCycles);
         LOG("Vol: Pulses=%lu, Vol=%d", pulseCount, vol);
         LOG("Pump: ZC Count =%lu", zcCount);
         LOG("Flags: Steam=%d, Shot=%d", steamFlag, shotFlag);
