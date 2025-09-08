@@ -25,8 +25,8 @@
 #include <PubSubClient.h>
 #include <WiFi.h>
 #include <ctype.h>
-#include <math.h>
 #include <esp_timer.h>
+#include <math.h>
 
 #include <cstdarg>
 #include <map>
@@ -63,8 +63,8 @@ constexpr int PRESS_PIN = 35;
 
 constexpr unsigned long PRESS_CYCLE = 100, PID_CYCLE = 250, PWM_CYCLE = 250, LOG_CYCLE = 2000;
 
-constexpr unsigned long IDLE_CYCLE = 5000;  // ms between publishes when idle (reduced chatter)
-constexpr unsigned long SHOT_CYCLE = 1000;  // ms between publishes during a shot
+constexpr unsigned long IDLE_CYCLE = 5000;       // ms between publishes when idle (reduced chatter)
+constexpr unsigned long SHOT_CYCLE = 1000;       // ms between publishes during a shot
 constexpr unsigned long OTA_ENABLE_MS = 300000;  // ms OTA window after enabling
 
 // Brew & Steam setpoint limits
@@ -175,8 +175,8 @@ bool shotFlag = false, preFlow = false, steamFlag = false, setupComplete = false
 
 // OTA
 static bool otaInitialized = false;
-static bool otaActive = false;  // minimize other work while OTA is in progress
-static unsigned long otaStart = 0;        // millis when OTA was enabled
+static bool otaActive = false;      // minimize other work while OTA is in progress
+static unsigned long otaStart = 0;  // millis when OTA was enabled
 
 // MQTT diagnostics
 static IPAddress g_mqttIp;
@@ -305,7 +305,7 @@ static void resolveBrokerIfNeeded() {
 
 // ---------- OTA ----------
 // Forward declaration for MQTT publish helper used in OTA callbacks
-static void publishStr(const char* topic, const String& v, bool retain = false);
+static void publishStr(const char* topic, const String& v, bool retain = true);
 /**
  * @brief Initialize ArduinoOTA once Wi‑Fi is connected.
  *
@@ -931,7 +931,7 @@ static void publishStr(const char* topic, const String& v, bool retain) {
 /**
  * @brief Publish a floating‑point value with fixed decimals.
  */
-static void publishNum(const char* topic, float v, uint8_t decimals = 1, bool retain = false,
+static void publishNum(const char* topic, float v, uint8_t decimals = 1, bool retain = true,
                        float threshold = 0.1f) {
     auto it = s_lastNum.find(topic);
     if (it != s_lastNum.end() && fabs(it->second - v) < threshold) return;
@@ -940,7 +940,7 @@ static void publishNum(const char* topic, float v, uint8_t decimals = 1, bool re
     dtostrf(v, 0, decimals, tmp);
     publishStr(topic, String(tmp), retain);
 }
-static void publishBool(const char* topic, bool on, bool retain = false) {
+static void publishBool(const char* topic, bool on, bool retain = true) {
     auto it = s_lastBool.find(topic);
     if (it != s_lastBool.end() && it->second == on) return;
     s_lastBool[String(topic)] = on;
@@ -1184,7 +1184,7 @@ static void ensureMqtt() {
             // Do this only once, right after a successful (re)connect.
             resetPublishCache();
             publishStates();
-            publishNumberStatesSnapshot(); // include retained number/config states once
+            publishNumberStatesSnapshot();  // include retained number/config states once
             // Reset cadence so the next periodic publish is spaced correctly.
             // Use millis() here since ensureMqtt() may be called outside the main cadence point.
             lastMqttTime = millis();
