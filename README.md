@@ -45,6 +45,9 @@ Getting Started
 - Optional OTA password:
   - In `platformio.ini` add build flag: `-D OTA_PASSWORD="your-password"` (or `OTA_PASSWORD_HASH`)
   - Match the `--auth` flag under `upload_flags` for `espota`.
+- Enable OTA via MQTT before uploading (opens a ~5 min window and pauses normal MQTT):
+  - `mosquitto_pub -h <broker> -t gaggia_classic/<UID>/ota/enable -n`
+  - Device resumes normal servicing when the update completes or the window expires.
 
 Home Assistant Integration
 --------------------------
@@ -75,6 +78,9 @@ mosquitto_pub -h <broker> -t gaggia_classic/<UID>/pid_guard/set -m 20.0
 # Heater ON/OFF
 mosquitto_pub -h <broker> -t gaggia_classic/<UID>/heater/set -m ON
 mosquitto_pub -h <broker> -t gaggia_classic/<UID>/heater/set -m OFF
+
+# Enable OTA window (~5 min)
+mosquitto_pub -h <broker> -t gaggia_classic/<UID>/ota/enable -n
 ```
 
 Tuning & Behavior
