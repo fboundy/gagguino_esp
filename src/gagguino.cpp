@@ -53,8 +53,10 @@ constexpr int MAX_CS = 16;
 constexpr int PRESS_PIN = 35;
 
 constexpr unsigned long PRESS_CYCLE = 100, PID_CYCLE = 500, PWM_CYCLE = 500, LOG_CYCLE = 2000;
-constexpr unsigned long MQTT_IDLE_CYCLE = 2000;  // ms between publishes when idle
-constexpr unsigned long MQTT_SHOT_CYCLE = 500;   // ms between publishes during a shot
+
+constexpr unsigned long IDLE_CYCLE = 2000;  // ms between publishes when idle
+constexpr unsigned long SHOT_CYCLE = 500;   // ms between publishes during a shot
+
 
 // Brew & Steam setpoint limits
 constexpr float BREW_MIN = 90.0f, BREW_MAX = 99.0f;
@@ -65,8 +67,13 @@ constexpr float STEAM_DEFAULT = 152.0f;
 
 constexpr float RREF = 430.0f, RNOMINAL = 100.0f;
 // Default PID params (overridable via MQTT number entities)
-constexpr float P_GAIN_TEMP = 20.0f, I_GAIN_TEMP = 1.0f, D_GAIN_TEMP = 100.0f,
-                WINDUP_GUARD_TEMP = 20.0f;
+// Default PID parameters tuned for stability
+// Kp: 15–16 [out/°C]
+// Ki: 0.3–0.5 [out/(°C·s)] → start at 0.35
+// Kd: 50–70 [out·s/°C] → start at 60
+// guard: ±8–±12% integral clamp on 0–100% heater
+constexpr float P_GAIN_TEMP = 15.0f, I_GAIN_TEMP = 0.35f, D_GAIN_TEMP = 60.0f,
+                WINDUP_GUARD_TEMP = 10.0f;
 
 constexpr float PRESS_TOL = 0.4f, PRESS_GRAD = 0.00903f, PRESS_INT_0 = -4.0f;
 constexpr int PRESS_BUFF_SIZE = 14;
@@ -127,7 +134,6 @@ uint8_t pressBuffIdx = 0;
 // Time/shot
 unsigned long nLoop = 0, currentTime = 0, lastPidTime = 0, lastPwmTime = 0, lastMqttTime = 0,
               lastLogTime = 0;
-;
 volatile unsigned long lastPulseTime = 0;
 unsigned long shotStart = 0, startTime = 0;
 float shotTime = 0;  //
@@ -365,12 +371,15 @@ static void ensureOta() {
  * @return Control output (unclamped)
  */
 // Continuous-time gains: Kp [out/°C], Ki [out/(°C·s)], Kd [out·s/°C]
-static float calcPID(float Kp, float Ki, float Kd, float sp, float pv,
-                     float dt,           // seconds (0.5 at 2 Hz)
-                     float& pvFilt,      // store filtered pv
-                     float& iSum,        // integral accumulator (∫err dt)
-                     float guard,        // limit on iTerm (e.g., 10 = ±10% duty)
-                     float dTau = 1.0f)  // derivative LPF time const (s), ~1×dt
+
+static float calcPID(float Kp, float Ki, float Kd,
+                     float sp, float pv,
+                     float dt,                    // seconds (0.5 at 2 Hz)
+                     float& pvFilt,               // store filtered pv
+                     float& iSum,                 // integral accumulator (∫err dt)
+                     float guard,                 // limit on iTerm (e.g., 10 = ±10% duty)
+                     float dTau = 1.0f)           // derivative LPF time const (s), ~1×dt
+
 {
     // 1) Error
     float err = sp - pv;
@@ -380,20 +389,23 @@ static float calcPID(float Kp, float Ki, float Kd, float sp, float pv,
 
     // 3) Derivative on measurement with 1st-order filter (dirty derivative)
     //    LPF on pv: pvFilt' = (pv - pvFilt)/dTau
-    float alpha = dt / (dTau + dt);   // 0<alpha<1
+
+    float alpha = dt / (dTau + dt);  // 0<alpha<1
+    float prevPvFilt = pvFilt;
     pvFilt += alpha * (pv - pvFilt);  // low-pass the measurement
-    static float lastPvFilt = 0.0f;
-    float dMeas = (pvFilt - lastPvFilt) / dt;
-    lastPvFilt = pvFilt;
+    float dMeas = (pvFilt - prevPvFilt) / dt;
+
 
     // 4) Terms
     float pTerm = Kp * err;
     float iTerm = Ki * iSum;
     // clamp the CONTRIBUTION of I (anti-windup)
-    if (iTerm > guard) iTerm = guard;
+
+    if (iTerm >  guard) iTerm =  guard;
     if (iTerm < -guard) iTerm = -guard;
 
-    float dTerm = -Kd * dMeas;  // derivative on measurement
+    float dTerm = -Kd * dMeas;          // derivative on measurement
+
 
     // 5) Output (unclamped here; clamp at actuator)
     return pTerm + iTerm + dTerm;
@@ -525,8 +537,11 @@ static void updateTempPID() {
     // Active target picks between brew and steam setpoints
     setTemp = steamFlag ? steamSetpoint : brewSetpoint;
 
-    heatPower = calcPID(pGainTemp, iGainTemp, dGainTemp, setTemp, currentTemp, dt, pvFiltTemp,
-                        iStateTemp, windupGuardTemp);
+
+    heatPower = calcPID(pGainTemp, iGainTemp, dGainTemp,
+                        setTemp, currentTemp,
+                        dt, pvFiltTemp, iStateTemp, windupGuardTemp);
+
     if (heatPower > 100.0f) heatPower = 100.0f;
     if (heatPower < 0.0f) heatPower = 0.0f;
     heatCycles = (int)((100.0f - heatPower) / 100.0f * PWM_CYCLE);
@@ -1334,10 +1349,13 @@ void loop() {
     // TRIAC control needs frequent checks (after OTA.handle to keep WiFi responsive)
     if (!otaActive) updateTriacControl();
 
+
+
     unsigned long publishInterval = shotFlag ? MQTT_SHOT_CYCLE : MQTT_IDLE_CYCLE;
     if (!otaActive && streamData && (currentTime - lastMqttTime) >= publishInterval) {
         if (mqttClient.connected()) publishStates();
         lastMqttTime = currentTime;
+
     }
 
     if (!otaActive && debugPrint &&
