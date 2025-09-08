@@ -47,6 +47,13 @@ static inline void LOG(const char* fmt, ...) {
     Serial.println(buf);
 }
 
+/**
+ * @brief Log a significant error and publish it to MQTT.
+ *
+ * Maintains a small rolling buffer of recent error messages to avoid
+ * unbounded growth while still providing context for debugging.
+ */
+
 namespace {
 constexpr int FLOW_PIN = 26, ZC_PIN = 25, HEAT_PIN = 27, AC_SENS = 14;
 constexpr int MAX_CS = 16;
@@ -98,6 +105,34 @@ namespace {
 Adafruit_MAX31865 max31865(MAX_CS);
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
+
+// Rolling buffer of recent significant error messages
+static String g_errorLog;
+
+/**
+ * @brief Log a significant error and publish it via MQTT.
+ */
+static inline void LOG_ERROR(const char* fmt, ...) {
+    static char buf[192];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    Serial.println(buf);
+
+    if (!g_errorLog.isEmpty()) g_errorLog += '\n';
+    g_errorLog += buf;
+
+    constexpr size_t MAX_ERR_LOG = 512;
+    if (g_errorLog.length() > MAX_ERR_LOG) {
+        int cut = g_errorLog.length() - MAX_ERR_LOG;
+        cut = g_errorLog.indexOf('\n', cut);
+        if (cut >= 0) g_errorLog = g_errorLog.substring(cut + 1);
+    }
+
+    if (mqttClient.connected())
+        mqttClient.publish(MQTT_ERRORS, g_errorLog.c_str(), true);
+}
 
 // Temps / PID
 float currentTemp = 0.0f, lastTemp = 0.0f, pvFiltTemp = 0.0f;
@@ -260,7 +295,7 @@ static void resolveBrokerIfNeeded() {
         LOG("MQTT: %s resolved to %s", MQTT_HOST, g_mqttIp.toString().c_str());
         mqttClient.setServer(g_mqttIp, MQTT_PORT);
     } else
-        LOG("MQTT: DNS resolve failed for %s", MQTT_HOST);
+        LOG_ERROR("MQTT: DNS resolve failed for %s", MQTT_HOST);
 }
 
 // ---------- OTA ----------
@@ -333,7 +368,7 @@ static void ensureOta() {
                 msg = "END";
                 break;
         }
-        LOG("OTA: Error %d (%s)", (int)error, msg);
+        LOG_ERROR("OTA: Error %d (%s)", (int)error, msg);
         otaActive = false;
     });
 
@@ -673,7 +708,7 @@ static String deviceJson() {
  */
 static void publishRetained(const char* topic, const String& payload) {
     if (!mqttClient.publish(topic, payload.c_str(), true))
-        LOG("MQTT: discovery publish failed (%s)", topic);
+        LOG_ERROR("MQTT: discovery publish failed (%s)", topic);
 }
 
 /**
@@ -853,7 +888,7 @@ static void publishDiscovery() {
  */
 static void publishStr(const char* topic, const String& v, bool retain) {
     if (!mqttClient.publish(topic, v.c_str(), retain))
-        LOG("MQTT: state publish failed (%s) val=%s", topic, v.c_str());
+        LOG_ERROR("MQTT: state publish failed (%s) val=%s", topic, v.c_str());
 }
 /**
  * @brief Publish a floating‑point value with fixed decimals.
@@ -1095,9 +1130,9 @@ static void ensureMqtt() {
     else
         ok = mqttClient.connect(MQTT_CLIENTID, nullptr, nullptr, MQTT_STATUS, 0, true, "offline");
     if (!ok)
-        LOG("MQTT: connect failed rc=%d (%s)  WiFi=%s RSSI=%d IP=%s GW=%s", mqttClient.state(),
-            mqttStateName(mqttClient.state()), wifiStatusName(WiFi.status()), WiFi.RSSI(),
-            WiFi.localIP().toString().c_str(), WiFi.gatewayIP().toString().c_str());
+        LOG_ERROR("MQTT: connect failed rc=%d (%s)  WiFi=%s RSSI=%d IP=%s GW=%s", mqttClient.state(),
+                  mqttStateName(mqttClient.state()), wifiStatusName(WiFi.status()), WiFi.RSSI(),
+                  WiFi.localIP().toString().c_str(), WiFi.gatewayIP().toString().c_str());
 }
 }  // namespace
 
