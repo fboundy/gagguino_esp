@@ -61,8 +61,8 @@ constexpr int PRESS_PIN = 35;
 
 constexpr unsigned long PRESS_CYCLE = 100, PID_CYCLE = 250, PWM_CYCLE = 250, LOG_CYCLE = 2000;
 
-constexpr unsigned long IDLE_CYCLE = 2000;  // ms between publishes when idle
-constexpr unsigned long SHOT_CYCLE = 500;   // ms between publishes during a shot
+constexpr unsigned long IDLE_CYCLE = 5000;  // ms between publishes when idle (reduced chatter)
+constexpr unsigned long SHOT_CYCLE = 1000;  // ms between publishes during a shot
 
 // Brew & Steam setpoint limits
 constexpr float BREW_MIN = 90.0f, BREW_MAX = 99.0f;
@@ -83,21 +83,20 @@ constexpr float P_GAIN_TEMP = 15.0f, I_GAIN_TEMP = 0.35f, D_GAIN_TEMP = 60.0f,
 // Derivative filter time constant (seconds), exposed to HA
 constexpr float D_TAU_TEMP = 0.8f;
 
-
 constexpr float PRESS_TOL = 0.4f, PRESS_GRAD = 0.00903f, PRESS_INT_0 = -4.0f;
 constexpr int PRESS_BUFF_SIZE = 14;
 constexpr float PRESS_THRESHOLD = 9.0f;
 
 // FLOW_CAL in mL per pulse (1 cc == 1 mL)
 constexpr float FLOW_CAL = 0.246f;
-constexpr unsigned long PULSE_MIN = 0;
+constexpr unsigned long PULSE_MIN = 3;  // ms debounce (bounce + double-edges)
 
 constexpr unsigned ZC_MIN = 4;
 constexpr unsigned long ZC_WAIT = 2000, ZC_OFF = 1000, SHOT_RESET = 30000;
 constexpr unsigned long AC_WAIT = 100;
 constexpr int STEAM_MIN = 20;
 
-const bool streamData = true, debugPrint = true;
+const bool streamData = true, debugPrint = false;
 }  // namespace
 
 // ---------- Devices / globals ----------
@@ -130,8 +129,7 @@ static inline void LOG_ERROR(const char* fmt, ...) {
         if (cut >= 0) g_errorLog = g_errorLog.substring(cut + 1);
     }
 
-    if (mqttClient.connected())
-        mqttClient.publish(MQTT_ERRORS, g_errorLog.c_str(), true);
+    if (mqttClient.connected()) mqttClient.publish(MQTT_ERRORS, g_errorLog.c_str(), true);
 }
 
 // Temps / PID
@@ -582,7 +580,12 @@ static void IRAM_ATTR flowInt() {
  * @brief Zero‑cross detect ISR: records pump activity timing.
  */
 static void IRAM_ATTR zcInt() {
-    lastZcTime = millis();
+    unsigned long now = millis();
+    // Guard against spurious re-triggers/noise (<~6 ms @ 50 Hz)
+    if (now - lastZcTime < 6) {
+        return;
+    }
+    lastZcTime = now;
     zcCount++;
 }
 
@@ -819,7 +822,6 @@ static void publishDiscovery() {
             "\",\"pl_on\":\"ON\",\"pl_off\":\"OFF\",\"avty_t\":\"" + String(MQTT_STATUS) +
             "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}");
 
-
     // --- numbers (controllable) ---
     publishRetained(
         c_brewset_number,
@@ -900,6 +902,11 @@ static void publishNum(const char* topic, float v, uint8_t decimals = 1, bool re
 }
 static void publishBool(const char* topic, bool on, bool retain = false) {
     publishStr(topic, on ? "ON" : "OFF", retain);
+}
+
+// Publish retained number/config states once (on connect) or on change.
+static void publishNumberStatesSnapshot() {
+    // NOTE: Config/number states are published on connect and on change only.
 }
 
 // Helper: immediately disable the heater output and prevent PID updates
@@ -1055,13 +1062,11 @@ static void ensureWifi() {
         last = now;
     }
     if (now == WL_CONNECTED) return;
-    static unsigned long t0 = 0;
-    if (millis() - t0 < 2000) return;
-    t0 = millis();
-    forceHeaterOff();
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    // gentler reconnect policy: don't tear down; try reconnect every 10s
+    static unsigned long lastTry = 0;
+    if (millis() - lastTry < 10000) return;
+    lastTry = millis();
+    WiFi.reconnect();
 }
 
 /**
@@ -1104,6 +1109,7 @@ static void ensureMqtt() {
             // ✅ B) Immediately publish a full snapshot so HA has data right away
             // Do this only once, right after a successful (re)connect.
             publishStates();
+            publishNumberStatesSnapshot(); // include retained number/config states once
             // Reset cadence so the next periodic publish is spaced correctly.
             // Use millis() here since ensureMqtt() may be called outside the main cadence point.
             lastMqttTime = millis();
@@ -1130,9 +1136,10 @@ static void ensureMqtt() {
     else
         ok = mqttClient.connect(MQTT_CLIENTID, nullptr, nullptr, MQTT_STATUS, 0, true, "offline");
     if (!ok)
-        LOG_ERROR("MQTT: connect failed rc=%d (%s)  WiFi=%s RSSI=%d IP=%s GW=%s", mqttClient.state(),
-                  mqttStateName(mqttClient.state()), wifiStatusName(WiFi.status()), WiFi.RSSI(),
-                  WiFi.localIP().toString().c_str(), WiFi.gatewayIP().toString().c_str());
+        LOG_ERROR("MQTT: connect failed rc=%d (%s)  WiFi=%s RSSI=%d IP=%s GW=%s",
+                  mqttClient.state(), mqttStateName(mqttClient.state()),
+                  wifiStatusName(WiFi.status()), WiFi.RSSI(), WiFi.localIP().toString().c_str(),
+                  WiFi.gatewayIP().toString().c_str());
 }
 }  // namespace
 
@@ -1176,7 +1183,7 @@ void setup() {
         LOG("Pressure Intercept reset to %f", pressInt);
     }
 
-    attachInterrupt(digitalPinToInterrupt(FLOW_PIN), flowInt, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(FLOW_PIN), flowInt, RISING);
     attachInterrupt(digitalPinToInterrupt(ZC_PIN), zcInt, RISING);
 
     pulseCount = 0;
@@ -1191,6 +1198,8 @@ void setup() {
 #if defined(ARDUINO_ARCH_ESP32)
     // Improve OTA/MQTT reliability by disabling WiFi modem sleep
     WiFi.setSleep(false);
+    // Auto-reassociate if the AP briefly disappears
+    WiFi.setAutoReconnect(true);
 #endif
     mqttClient.setServer(MQTT_HOST, MQTT_PORT);
     mqttClient.setCallback(mqttCallback);
