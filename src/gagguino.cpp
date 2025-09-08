@@ -26,6 +26,7 @@
 #include <WiFi.h>
 #include <ctype.h>
 #include <math.h>
+#include <esp_timer.h>
 
 #include <cstdarg>
 
@@ -155,14 +156,15 @@ uint8_t pressBuffIdx = 0;
 // Time/shot
 unsigned long nLoop = 0, currentTime = 0, lastPidTime = 0, lastPwmTime = 0, lastMqttTime = 0,
               lastLogTime = 0;
-volatile unsigned long lastPulseTime = 0;
+// microsecond timestamps for ISR debounce
+volatile int64_t lastPulseTime = 0;
 unsigned long shotStart = 0, startTime = 0;
 float shotTime = 0;  //
 
 // Flow / flags
 volatile unsigned long pulseCount = 0;
 volatile unsigned long zcCount = 0;
-volatile unsigned long lastZcTime = 0;
+volatile int64_t lastZcTime = 0;  // microsecond timestamp
 int vol = 0, preFlowVol = 0, shotVol = 0;
 unsigned int lastVol = 0;
 bool prevSteamFlag = false, ac = false;
@@ -452,13 +454,14 @@ static void checkShotStartStop() {
         preFlow = true;
         preFlowVol = 0;
     }
+    unsigned long lastZcTimeMs = lastZcTime / 1000;
     if ((steamFlag && !prevSteamFlag) ||
-        (currentTime - lastZcTime >= SHOT_RESET && shotFlag && currentTime > lastZcTime)) {
+        (currentTime - lastZcTimeMs >= SHOT_RESET && shotFlag && currentTime > lastZcTimeMs)) {
         pulseCount = 0;
         lastVol = 0;
         shotVol = 0;
         shotTime = 0;
-        lastPulseTime = currentTime;
+        lastPulseTime = esp_timer_get_time();
         shotFlag = false;
         preFlow = false;
     }
@@ -535,7 +538,8 @@ static void updatePressure() {
 static void updateSteamFlag() {
     ac = !digitalRead(AC_SENS);
     prevSteamFlag = steamFlag;
-    if ((millis() - lastZcTime) > ZC_OFF && ac) {
+    int64_t now = esp_timer_get_time();
+    if ((now - lastZcTime) > ZC_OFF * 1000 && ac) {
         acCount++;
         if (acCount > STEAM_MIN) {
             steamFlag = true;
@@ -570,8 +574,8 @@ static void updateVols() {
  * @brief Flow sensor ISR with simple debounce using `PULSE_MIN`.
  */
 static void IRAM_ATTR flowInt() {
-    unsigned long now = millis();
-    if (now - lastPulseTime >= PULSE_MIN) {
+    int64_t now = esp_timer_get_time();
+    if (now - lastPulseTime >= PULSE_MIN * 1000) {
         pulseCount++;
         lastPulseTime = now;
     }
@@ -580,9 +584,9 @@ static void IRAM_ATTR flowInt() {
  * @brief Zero‑cross detect ISR: records pump activity timing.
  */
 static void IRAM_ATTR zcInt() {
-    unsigned long now = millis();
+    int64_t now = esp_timer_get_time();
     // Guard against spurious re-triggers/noise (<~6 ms @ 50 Hz)
-    if (now - lastZcTime < 6) {
+    if (now - lastZcTime < 6000) {
         return;
     }
     lastZcTime = now;
@@ -1083,6 +1087,7 @@ static void ensureWifi() {
     if (connecting) {
         // Wait briefly for connection result while yielding to other tasks
         wl_status_t res = static_cast<wl_status_t>(WiFi.waitForConnectResult(100));
+
         if (res == WL_CONNECTED) {
             connecting = false;
         } else if (millis() - connectStart > 10000) {
@@ -1214,7 +1219,7 @@ void setup() {
     startTime = millis();
     lastPidTime = startTime;
     lastPwmTime = startTime;
-    lastPulseTime = startTime;
+    lastPulseTime = esp_timer_get_time();
     setupComplete = true;
 
     WiFi.mode(WIFI_STA);
