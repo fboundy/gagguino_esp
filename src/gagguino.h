@@ -20,7 +20,7 @@ namespace gag {
  * @brief Initialize hardware, connectivity and discovery.
  *
  * Responsibilities:
- * - Configure pins and peripherals (MAX31865, ADC, TRIAC gate, etc.).
+ * - Configure pins and peripherals (MAX31865, ADC, etc.).
  * - Start Wi‑Fi and set MQTT parameters (but connection is retried in the main loop).
  * - Initialize Over‑The‑Air (OTA) update handling once Wi‑Fi is ready.
  * - Calibrate/zero pressure intercept on boot if near atmospheric.

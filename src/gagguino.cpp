@@ -4,7 +4,7 @@
  *
  * High‑level responsibilities:
  * - Temperature control using a MAX31865 RTD amplifier (PT100) and PID.
- * - Heater PWM drive and optional TRIAC phase‑angle dimming for pump control.
+ * - Heater PWM drive.
  * - Flow, pressure and shot timing measurement with debounced ISR counters.
  * - Wi‑Fi + MQTT with Home Assistant discovery for control/telemetry.
  * - Robust OTA (ArduinoOTA) that throttles other work while an update runs.
@@ -14,7 +14,6 @@
  * - ZC_PIN (25)     : AC zero‑cross detect (interrupt on RISING)
  * - HEAT_PIN (27)   : Boiler relay/SSR output (PWM windowing)
  * - AC_SENS (14)    : Steam switch sense (digital input)
- * - TRIAC_PIN (17)  : TRIAC gate output for pump phase control
  * - MAX_CS (16)     : MAX31865 SPI chip‑select
  * - PRESS_PIN (35)  : Analog pressure sensor input
  */
@@ -49,7 +48,7 @@ static inline void LOG(const char* fmt, ...) {
 }
 
 namespace {
-constexpr int FLOW_PIN = 26, ZC_PIN = 25, HEAT_PIN = 27, AC_SENS = 14, TRIAC_PIN = 17;
+constexpr int FLOW_PIN = 26, ZC_PIN = 25, HEAT_PIN = 27, AC_SENS = 14;
 constexpr int MAX_CS = 16;
 constexpr int PRESS_PIN = 35;
 
@@ -77,15 +76,6 @@ constexpr float P_GAIN_TEMP = 15.0f, I_GAIN_TEMP = 0.35f, D_GAIN_TEMP = 60.0f,
 // Derivative filter time constant (seconds), exposed to HA
 constexpr float D_TAU_TEMP = 0.8f;
 
-// Warm-up helpers (kept internal, neutralized)
-// Cap max heater while far below setpoint; and hold off integral until near target.
-constexpr float WARMUP_CAP_PCT_DEFAULT = 100.0f;  // % (100 = no cap)
-constexpr float I_HOLDOFF_BAND_DEFAULT = 0.0f;    // °C (0 = no holdoff)
-
-// Smoothing for non-linear bits (neutralized)
-constexpr float I_HOLDOFF_HYST = 0.0f;   // °C
-constexpr float I_LEAK_FACTOR = 1.0f;    // integrate at full rate
-constexpr float CAP_BLEND_EXTRA = 0.0f;  // °C
 
 constexpr float PRESS_TOL = 0.4f, PRESS_GRAD = 0.00903f, PRESS_INT_0 = -4.0f;
 constexpr int PRESS_BUFF_SIZE = 14;
@@ -101,11 +91,6 @@ constexpr unsigned long AC_WAIT = 100;
 constexpr int STEAM_MIN = 20;
 
 const bool streamData = true, debugPrint = true;
-// TRIAC dimmer control (RobotDyn module)
-constexpr bool TRIAC_ENABLED = true;  // set to true if using dimmer module
-constexpr int MAINS_HZ = 50;          // 50 or 60
-constexpr unsigned long HALF_CYCLE_US = (1000000UL / (2 * MAINS_HZ));
-constexpr unsigned int TRIAC_PULSE_US = 120;  // microseconds
 }  // namespace
 
 // ---------- Devices / globals ----------
@@ -123,20 +108,9 @@ float iStateTemp = 0.0f, heatPower = 0.0f;
 // Live-tunable PID parameters (default to constexprs above)
 float pGainTemp = P_GAIN_TEMP, iGainTemp = I_GAIN_TEMP, dGainTemp = D_GAIN_TEMP,
       windupGuardTemp = WINDUP_GUARD_TEMP, dTauTemp = D_TAU_TEMP;
-// Internal warm-up parameters (neutralized)
-float warmupCapPct = WARMUP_CAP_PCT_DEFAULT, iHoldoffBand = I_HOLDOFF_BAND_DEFAULT;
 int heatCycles = 0;
 bool heaterState = false;
 bool heaterEnabled = true;  // HA switch default ON at boot
-// TRIAC: manual pump power percentage 0..100, controlled via HA number
-float pumpPowerPct = 0.0f;
-// TRIAC scheduling state
-volatile unsigned long lastZcMicros = 0;
-volatile bool zcFlagTriac = false;
-bool triacPulsePending = false;
-bool triacPulseOn = false;
-unsigned long triacFireTimeUs = 0;
-unsigned long triacPulseEndUs = 0;
 
 // Pressure
 int rawPress = 0;
@@ -183,8 +157,6 @@ char t_shotvol_state[96], t_settemp_state[96], t_curtemp_state[96], t_press_stat
     t_shottime_state[96], t_ota_state[96];
 // Switch state/command topics
 char t_heater_state[96], t_heater_cmd[96];
-// TRIAC pump power number topics
-char t_pumppower_state[96], t_pumppower_cmd[96];
 // Diagnostics state topics
 char t_accnt_state[96], t_zccnt_state[96], t_pulsecnt_state[96];
 // Binary sensor state topics
@@ -209,9 +181,6 @@ char c_brewset_number[128], c_steamset_number[128];
 char c_piddtau_number[128];  // PID D Tau (seconds)
 // Switch config
 char c_heater[128];
-// TRIAC pump power number config
-char c_pumppower_number[128];
-
 // ---------- helpers ----------
 /**
  * @brief Convert Wi‑Fi status to a readable string.
@@ -304,7 +273,7 @@ static void publishStr(const char* topic, const String& v, bool retain = false);
  * - Hostname is derived from MAC address for stability.
  * - If `OTA_PASSWORD` or `OTA_PASSWORD_HASH` is defined (via build flags),
  *   OTA authentication is enforced.
- * - During OTA, heater and TRIAC outputs are disabled and main work throttled.
+ * - During OTA, the heater output is disabled and main work throttled.
  */
 static void ensureOta() {
     if (otaInitialized || WiFi.status() != WL_CONNECTED) return;
@@ -327,7 +296,6 @@ static void ensureOta() {
         otaActive = true;  // signal loop to reduce load and suppress MQTT publishing
         // Turn off heater to reduce power/noise during OTA
         digitalWrite(HEAT_PIN, LOW);
-        digitalWrite(TRIAC_PIN, LOW);
         heaterState = false;
     });
     ArduinoOTA.onEnd([]() {
@@ -400,22 +368,12 @@ static float calcPID(float Kp, float Ki, float Kd, float sp, float pv,
                      float guard,          // clamp on iTerm (output units)
                      float dTau = 1.0f,    // derivative LPF time const (s)
                      float outMin = 0.0f,  // actuator limits (for cond. integration)
-                     float outMax = 100.0f,
-                     float iHoldoff = 0.1f)  // integrate only when |err| ≤ iHoldoff
-
-{
+                     float outMax = 100.0f) {
     // 1) Error
     float err = sp - pv;
 
-    // 2) Integral with warm-up holdoff + hysteresis + leaky I
-    //    - Integrate normally when err <= (iHoldoff + I_HOLDOFF_HYST)
-    //    - When far below setpoint (err > iHoldoff + hysteresis), integrate at a reduced rate
-    if (err <= iHoldoff + I_HOLDOFF_HYST) {
-        iSum += err * dt;
-    } else {
-        // leaky integration to avoid steady-state bias once cap relaxes
-        iSum += (err * dt * I_LEAK_FACTOR);
-    }
+    // 2) Integral
+    iSum += err * dt;
 
     // 3) Derivative on measurement with 1st-order filter (dirty derivative)
     //    LPF on pv: pvFilt' = (pv - pvFilt)/dTau
@@ -438,13 +396,11 @@ static float calcPID(float Kp, float Ki, float Kd, float sp, float pv,
 
     // 6) Conditional integration: don’t integrate when pushing into saturation
     if ((u >= outMax && err > 0.0f) || (u <= outMin && err < 0.0f)) {
-        if (err <= iHoldoff + I_HOLDOFF_HYST) {
-            iSum -= err * dt;  // undo this step’s integral
-            iTerm = Ki * iSum;
-            if (iTerm > guard) iTerm = guard;
-            if (iTerm < -guard) iTerm = -guard;
-            u = pTerm + iTerm + dTerm;
-        }
+        iSum -= err * dt;  // undo this step’s integral
+        iTerm = Ki * iSum;
+        if (iTerm > guard) iTerm = guard;
+        if (iTerm < -guard) iTerm = -guard;
+        u = pTerm + iTerm + dTerm;
     }
     return u;
 }
@@ -495,23 +451,7 @@ static void updateTempPID() {
 
     heatPower = calcPID(pGainTemp, iGainTemp, dGainTemp, setTemp, currentTemp, dt, pvFiltTemp,
                         iStateTemp, windupGuardTemp, /*dTau=*/dTauTemp, /*outMin=*/0.0f,
-                        /*outMax=*/100.0f, /*iHoldoff=*/iHoldoffBand);
-
-    // ── Warm-up power cap with linear fade & hysteresis
-    float errNow = setTemp - currentTemp;  // °C
-    if (errNow > 0.0f) {
-        // Fully capped when err >= (holdoff + CAP_BLEND_EXTRA)
-        float cap = 100.0f;
-        float eFull = iHoldoffBand + CAP_BLEND_EXTRA;
-        if (errNow >= eFull) {
-            cap = warmupCapPct;
-        } else if (errNow > iHoldoffBand) {
-            // blend cap → 100% as we approach iHoldoffBand
-            float t = (errNow - iHoldoffBand) / (eFull - iHoldoffBand);  // 0..1
-            cap = warmupCapPct + (1.0f - t) * (100.0f - warmupCapPct);
-        }  // else within holdoff band: cap = 100%
-        if (heatPower > cap) heatPower = cap;
-    }
+                        /*outMax=*/100.0f);
 
     if (heatPower > 100.0f) heatPower = 100.0f;
     if (heatPower < 0.0f) heatPower = 0.0f;
@@ -592,53 +532,6 @@ static void updateVols() {
     shotVol = (preFlow || !shotFlag) ? 0 : (vol - preFlowVol);
 }
 
-// TRIAC dimmer control (Pump): schedule and fire gate pulses after zero-cross
-/**
- * @brief Phase‑angle control for pump TRIAC synchronized to zero‑cross.
- *
- * Schedules a short gate pulse at a delay mapped from desired power.
- * Disabled during OTA to prioritize Wi‑Fi responsiveness.
- */
-static void updateTriacControl() {
-    if (!TRIAC_ENABLED) return;
-    // Disable TRIAC during OTA to keep WiFi responsive
-    if (otaActive) {
-        digitalWrite(TRIAC_PIN, LOW);
-        triacPulsePending = false;
-        triacPulseOn = false;
-        return;
-    }
-    // New zero-cross detected: compute delay based on desired power
-    if (zcFlagTriac) {
-        zcFlagTriac = false;
-        float pct = pumpPowerPct;
-        if (pct <= 0.0f) {
-            triacPulsePending = false;
-            triacPulseOn = false;
-            digitalWrite(TRIAC_PIN, LOW);
-        } else if (pct >= 100.0f) {
-            // Fire almost immediately after ZC
-            triacFireTimeUs = lastZcMicros + 50;  // small fixed delay
-            triacPulsePending = true;
-        } else {
-            unsigned long delayUs = (unsigned long)((100.0f - pct) * 0.01f * (float)HALF_CYCLE_US);
-            triacFireTimeUs = lastZcMicros + delayUs;
-            triacPulsePending = true;
-        }
-    }
-    unsigned long nowUs = micros();
-    if (triacPulsePending && ((long)(nowUs - triacFireTimeUs) >= 0)) {
-        digitalWrite(TRIAC_PIN, HIGH);
-        triacPulseOn = true;
-        triacPulseEndUs = nowUs + TRIAC_PULSE_US;
-        triacPulsePending = false;
-    }
-    if (triacPulseOn && ((long)(micros() - triacPulseEndUs) >= 0)) {
-        digitalWrite(TRIAC_PIN, LOW);
-        triacPulseOn = false;
-    }
-}
-
 // ISRs
 /**
  * @brief Flow sensor ISR with simple debounce using `PULSE_MIN`.
@@ -651,14 +544,11 @@ static void IRAM_ATTR flowInt() {
     }
 }
 /**
- * @brief Zero‑cross detect ISR: records timing and triggers TRIAC scheduling.
+ * @brief Zero‑cross detect ISR: records pump activity timing.
  */
 static void IRAM_ATTR zcInt() {
     lastZcTime = millis();
     zcCount++;
-    // TRIAC phase control timing (use micros for precision)
-    lastZcMicros = micros();
-    zcFlagTriac = true;
 }
 
 // ---------- HA Discovery helpers ----------
@@ -687,11 +577,6 @@ static void buildTopics() {
     snprintf(t_shottime_state, sizeof(t_shottime_state), "%s/%s/shot_time/state", STATE_BASE,
              uid_suffix);
     snprintf(t_ota_state, sizeof(t_ota_state), "%s/%s/ota/status", STATE_BASE, uid_suffix);
-    // TRIAC power number topics (pump power)
-    snprintf(t_pumppower_state, sizeof(t_pumppower_state), "%s/%s/pump_power/state", STATE_BASE,
-             uid_suffix);
-    snprintf(t_pumppower_cmd, sizeof(t_pumppower_cmd), "%s/%s/pump_power/set", STATE_BASE,
-             uid_suffix);
     // heater switch topics
     snprintf(t_heater_state, sizeof(t_heater_state), "%s/%s/heater/state", STATE_BASE, uid_suffix);
     snprintf(t_heater_cmd, sizeof(t_heater_cmd), "%s/%s/heater/set", STATE_BASE, uid_suffix);
@@ -769,9 +654,6 @@ static void buildTopics() {
              dev_id);
     // switch
     snprintf(c_heater, sizeof(c_heater), "%s/switch/%s_heater/config", DISCOVERY_PREFIX, dev_id);
-    // TRIAC power number (pump power)
-    snprintf(c_pumppower_number, sizeof(c_pumppower_number), "%s/number/%s_pump_power/config",
-             DISCOVERY_PREFIX, dev_id);
 }
 
 /**
@@ -902,16 +784,6 @@ static void publishDiscovery() {
             "\",\"pl_on\":\"ON\",\"pl_off\":\"OFF\",\"avty_t\":\"" + String(MQTT_STATUS) +
             "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}");
 
-    // --- number: pump power (TRIAC) ---
-    publishRetained(c_pumppower_number, String("{\"name\":\"Pump Power\",\"uniq_id\":\"") + dev_id +
-                                            "_pump_power\",\"cmd_t\":\"" + t_pumppower_cmd +
-                                            "\",\"stat_t\":\"" + t_pumppower_state +
-                                            "\",\"unit_of_meas\":\"%\",\"min\":0,\"max\":100,"
-                                            "\"step\":1,\"mode\":\"auto\",\"avty_t\":\"" +
-                                            String(MQTT_STATUS) +
-                                            "\",\"pl_avail\":\"online\",\"pl_not_avail\":"
-                                            "\"offline\",\"entity_category\":\"config\",\"dev\":" +
-                                            dev + "}");
 
     // --- numbers (controllable) ---
     publishRetained(
@@ -943,8 +815,6 @@ static void publishDiscovery() {
                                           "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\","
                                           "\"entity_category\":\"config\",\"dev\":" +
                                           dev + "}");
-
-    // (warm-up cap and I holdoff numbers removed)
 
     // PID number entities
     publishRetained(c_pidp_number,
@@ -1009,8 +879,6 @@ static void publishStates() {
     publishNum(t_shottime_state, shotTime, 1);  // seconds
     // heater switch state (retained so HA keeps last state)
     publishBool(t_heater_state, heaterEnabled, true);
-    // Pump power state (TRIAC, retained)
-    publishNum(t_pumppower_state, pumpPowerPct, 0, true);
     // diagnostics
     publishNum(t_accnt_state, acCount, 0);
     publishNum(t_zccnt_state, zcCount, 0);
@@ -1034,7 +902,7 @@ static void publishStates() {
 
 // ---------- MQTT callback (handle both setpoints) ----------
 /**
- * @brief Handle inbound MQTT commands (setpoints, PID gains, pump power, switch).
+ * @brief Handle inbound MQTT commands (setpoints, PID gains, heater switch).
  */
 static void mqttCallback(char* topic, uint8_t* payload, unsigned int len) {
     auto parse_clamped = [&](const char* t, float lo, float hi, float& outVal) -> bool {
@@ -1096,18 +964,11 @@ static void mqttCallback(char* topic, uint8_t* payload, unsigned int len) {
         LOG("HA: PID Guard -> %.2f", windupGuardTemp);
     }
 
-    // Warm-up cap (%)
     // dTau (0.1 .. 5.0 seconds)
     if (parse_clamped(t_piddtau_cmd, 0.1f, 5.0f, tmp)) {
         dTauTemp = tmp;
         publishNum(t_piddtau_state, dTauTemp, 2, true);
         LOG("HA: PID D Tau -> %.2f s", dTauTemp);
-    }
-    // TRIAC pump power (0..100)
-    if (parse_clamped(t_pumppower_cmd, 0.0f, 100.0f, tmp)) {
-        pumpPowerPct = tmp;
-        publishNum(t_pumppower_state, pumpPowerPct, 0, true);
-        LOG("HA: Pump Power -> %.0f%%", pumpPowerPct);
     }
     // heater switch
     bool hv;
@@ -1136,6 +997,10 @@ static void mqttCallback(char* topic, uint8_t* payload, unsigned int len) {
  */
 static void ensureWifi() {
     wl_status_t now = WiFi.status();
+    if (now != WL_CONNECTED) {
+        digitalWrite(HEAT_PIN, LOW);
+        heaterState = false;
+    }
     static wl_status_t last = (wl_status_t)255;
     if (now != last) {
         if (now == WL_CONNECTED) {
@@ -1153,6 +1018,8 @@ static void ensureWifi() {
     static unsigned long t0 = 0;
     if (millis() - t0 < 2000) return;
     t0 = millis();
+    digitalWrite(HEAT_PIN, LOW);
+    heaterState = false;
     WiFi.disconnect(true);
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -1173,6 +1040,8 @@ static void ensureMqtt() {
     static bool lastConn = false;
     if (WiFi.status() != WL_CONNECTED) {
         lastConn = false;
+        digitalWrite(HEAT_PIN, LOW);
+        heaterState = false;
         return;
     }
     if (mqttClient.connected()) {
@@ -1194,9 +1063,6 @@ static void ensureMqtt() {
             mqttClient.subscribe(t_piddtau_cmd);
             // heater switch
             mqttClient.subscribe(t_heater_cmd);
-            // TRIAC pump power control
-            mqttClient.subscribe(t_pumppower_cmd);
-
             // ✅ B) Immediately publish a full snapshot so HA has data right away
             // Do this only once, right after a successful (re)connect.
             publishStates();
@@ -1207,6 +1073,9 @@ static void ensureMqtt() {
         lastConn = true;
         return;
     }
+    // Ensure heater is off while attempting MQTT reconnect
+    digitalWrite(HEAT_PIN, LOW);
+    heaterState = false;
     if (lastConn) {
         LOG("MQTT: disconnected (state=%d %s) — will retry", mqttClient.state(),
             mqttStateName(mqttClient.state()));
@@ -1247,13 +1116,11 @@ void setup() {
 
     pinMode(MAX_CS, OUTPUT);
     pinMode(HEAT_PIN, OUTPUT);
-    pinMode(TRIAC_PIN, OUTPUT);
     pinMode(PRESS_PIN, INPUT);
     pinMode(FLOW_PIN, INPUT_PULLUP);
     pinMode(ZC_PIN, INPUT);
     pinMode(AC_SENS, INPUT_PULLUP);
     digitalWrite(HEAT_PIN, LOW);
-    digitalWrite(TRIAC_PIN, LOW);
     heaterState = false;
 
     // Initialize filtered PV & lastTemp to avoid first-step D kick
@@ -1336,8 +1203,6 @@ void loop() {
 
     ensureWifi();
     ensureMqtt();
-    // TRIAC control needs frequent checks (after OTA.handle to keep WiFi responsive)
-    if (!otaActive) updateTriacControl();
 
     unsigned long publishInterval = shotFlag ? SHOT_CYCLE : IDLE_CYCLE;
     if (!otaActive && streamData && (currentTime - lastMqttTime) >= publishInterval) {

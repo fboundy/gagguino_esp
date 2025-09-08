@@ -1,16 +1,15 @@
 Gagguino ESP – ESP32 Firmware for Gaggia Classic
 ================================================
 
-An ESP32-based controller for the Gaggia Classic espresso machine featuring PID temperature control (MAX31865 + PT100), optional TRIAC pump phase control, flow/pressure/shot timing, MQTT with Home Assistant discovery, and robust OTA updates.
+An ESP32-based controller for the Gaggia Classic espresso machine featuring PID temperature control (MAX31865 + PT100), flow/pressure/shot timing, MQTT with Home Assistant discovery, and robust OTA updates.
 
 Features
 --------
 - PID temperature control using MAX31865 (PT100) with anti-windup and derivative on measurement.
 - Heater control via time-proportioning PWM windowing.
-- Optional TRIAC phase-angle control for pump power.
 - Flow pulses → volume, pressure sampling with moving average, and shot timing.
 - Wi‑Fi + MQTT (PubSubClient) with Home Assistant discovery (sensors, numbers, switch, binary sensors).
-- ArduinoOTA with safety handling (heater/TRIAC disabled during OTA).
+- ArduinoOTA with safety handling (heater disabled during OTA).
 
 Hardware / Pinout (ESP32 dev board defaults)
 -------------------------------------------
@@ -18,7 +17,6 @@ Hardware / Pinout (ESP32 dev board defaults)
 - `ZC_PIN` 25: AC zero‑cross detect (interrupt on RISING)
 - `HEAT_PIN` 27: Boiler relay/SSR output (time‑proportioning)
 - `AC_SENS` 14: Steam switch sense (digital input)
-- `TRIAC_PIN` 17: TRIAC gate output (pump phase control)
 - `MAX_CS` 16: MAX31865 SPI chip‑select
 - `PRESS_PIN` 35: Analog pressure sensor input
 
@@ -55,7 +53,7 @@ Home Assistant Integration
 - Entities (auto‑created on first connect):
   - Sensors: Shot Volume (mL), Set Temperature (°C), Current Temperature (°C), Pressure (bar), Shot Time (s), OTA Status
   - Binary sensors: Shot, Pre‑Flow, Steam
-  - Numbers (settable): Brew Setpoint (90–99 °C), Steam Setpoint (145–155 °C), PID P/I/D/Guard, Pump Power (%)
+  - Numbers (settable): Brew Setpoint (90–99 °C), Steam Setpoint (145–155 °C), PID P/I/D/Guard
   - Switch: Heater Enable
 
 MQTT Topics
@@ -74,9 +72,6 @@ mosquitto_pub -h <broker> -t gaggia_classic/<UID>/pid_i/set -m 1.0
 mosquitto_pub -h <broker> -t gaggia_classic/<UID>/pid_d/set -m 100.0
 mosquitto_pub -h <broker> -t gaggia_classic/<UID>/pid_guard/set -m 20.0
 
-# Set pump power to 60%
-mosquitto_pub -h <broker> -t gaggia_classic/<UID>/pump_power/set -m 60
-
 # Heater ON/OFF
 mosquitto_pub -h <broker> -t gaggia_classic/<UID>/heater/set -m ON
 mosquitto_pub -h <broker> -t gaggia_classic/<UID>/heater/set -m OFF
@@ -88,22 +83,21 @@ Tuning & Behavior
 - PID defaults (overridable via MQTT numbers): `P=20.0`, `I=1.0`, `D=100.0`, `Guard=20.0`.
 - Pressure: analog read with linear conversion; intercept is auto‑zeroed at boot if near 0 bar.
 - Heater: time‑proportioning window (`PWM_CYCLE`) with dynamic ON time from PID result.
-- TRIAC pump: phase‑angle, synchronized to zero‑cross; disabled during OTA.
 
 Troubleshooting
 ---------------
 - Serial monitor at `115200` shows boot logs, Wi‑Fi/MQTT status, and optional periodic diagnostics.
 - MAX31865 diagnostics: firmware logs faults and raw/temperature reads to help validate wiring.
-- OTA: Device hostname is derived from MAC (e.g. `gaggia-ABCDEF`). During OTA the heater/TRIAC are forced off and other work is throttled.
+- OTA: Device hostname is derived from MAC (e.g. `gaggia-ABCDEF`). During OTA the heater is forced off and other work is throttled.
 
 Safety
 ------
-- Mains voltage and TRIAC drivers are dangerous. Ensure proper isolation, fusing, and enclosure.
+- Mains voltage is dangerous. Ensure proper isolation, fusing, and enclosure.
 - Verify all pin mappings, voltages, and grounds before powering the machine.
 
 Project Layout
 --------------
-- `src/gagguino.cpp` – main firmware logic, OTA/MQTT/HA, PID, TRIAC, sensors.
+- `src/gagguino.cpp` – main firmware logic, OTA/MQTT/HA, PID, sensors.
 - `src/gagguino.h` – public entry points for `setup()`/`loop()` in the `gag` namespace.
 - `src/main.cpp` – minimal sketch bridging Arduino to `gag::setup/loop`.
 - `src/secrets.h` – Wi‑Fi and MQTT configuration.
