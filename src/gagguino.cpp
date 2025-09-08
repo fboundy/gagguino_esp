@@ -26,6 +26,7 @@
 #include <PubSubClient.h>
 #include <WiFi.h>
 #include <ctype.h>
+#include <math.h>
 
 #include <cstdarg>
 
@@ -54,9 +55,8 @@ constexpr int PRESS_PIN = 35;
 
 constexpr unsigned long PRESS_CYCLE = 100, PID_CYCLE = 500, PWM_CYCLE = 500, LOG_CYCLE = 2000;
 
-constexpr unsigned long IDLE_CYCLE = 2000;  // ms between publishes when idle
-constexpr unsigned long SHOT_CYCLE = 500;   // ms between publishes during a shot
-
+constexpr unsigned long MQTT_IDLE_CYCLE = 2000;  // ms between publishes when idle
+constexpr unsigned long MQTT_SHOT_CYCLE = 500;   // ms between publishes during a shot
 
 // Brew & Steam setpoint limits
 constexpr float BREW_MIN = 90.0f, BREW_MAX = 99.0f;
@@ -372,43 +372,56 @@ static void ensureOta() {
  */
 // Continuous-time gains: Kp [out/°C], Ki [out/(°C·s)], Kd [out·s/°C]
 
-static float calcPID(float Kp, float Ki, float Kd,
-                     float sp, float pv,
-                     float dt,                    // seconds (0.5 at 2 Hz)
-                     float& pvFilt,               // store filtered pv
-                     float& iSum,                 // integral accumulator (∫err dt)
-                     float guard,                 // limit on iTerm (e.g., 10 = ±10% duty)
-                     float dTau = 1.0f)           // derivative LPF time const (s), ~1×dt
+// ──────────────────────────────────────────────────────────────────────────────
+//  PID: dt-scaled I & D, iTerm clamp, derivative LPF, conditional integration
+// ──────────────────────────────────────────────────────────────────────────────
+static float calcPID(float Kp, float Ki, float Kd, float sp, float pv,
+                     float dt,             // seconds (0.5 at 2 Hz)
+                     float& pvFilt,        // filtered PV (state)
+                     float& iSum,          // ∫err dt  (state)
+                     float guard,          // clamp on iTerm (output units)
+                     float dTau = 1.0f,    // derivative LPF time const (s)
+                     float outMin = 0.0f,  // actuator limits (for cond. integration)
+                     float outMax = 100.0f,
+                     float iDeadband = 0.1f)  // don’t integrate tiny errors
 
 {
     // 1) Error
     float err = sp - pv;
 
-    // 2) Integral (scaled by dt)
-    iSum += err * dt;
+    // 2) Integral (scaled by dt) with small deadband
+    if (fabsf(err) > iDeadband) iSum += err * dt;
 
     // 3) Derivative on measurement with 1st-order filter (dirty derivative)
     //    LPF on pv: pvFilt' = (pv - pvFilt)/dTau
-
     float alpha = dt / (dTau + dt);  // 0<alpha<1
     float prevPvFilt = pvFilt;
-    pvFilt += alpha * (pv - pvFilt);  // low-pass the measurement
-    float dMeas = (pvFilt - prevPvFilt) / dt;
-
+    pvFilt += alpha * (pv - pvFilt);           // low-pass the measurement
+    float dMeas = (pvFilt - prevPvFilt) / dt;  // derivative of filtered pv
 
     // 4) Terms
     float pTerm = Kp * err;
     float iTerm = Ki * iSum;
     // clamp the CONTRIBUTION of I (anti-windup)
-
-    if (iTerm >  guard) iTerm =  guard;
+    if (iTerm > guard) iTerm = guard;
     if (iTerm < -guard) iTerm = -guard;
 
-    float dTerm = -Kd * dMeas;          // derivative on measurement
+    float dTerm = -Kd * dMeas;  // derivative on measurement
 
+    // 5) Output (pre-clamp)
+    float u = pTerm + iTerm + dTerm;
 
-    // 5) Output (unclamped here; clamp at actuator)
-    return pTerm + iTerm + dTerm;
+    // 6) Conditional integration: don’t integrate when pushing into saturation
+    if ((u >= outMax && err > 0.0f) || (u <= outMin && err < 0.0f)) {
+        if (fabsf(err) > iDeadband) {
+            iSum -= err * dt;  // undo this step’s integral
+            iTerm = Ki * iSum;
+            if (iTerm > guard) iTerm = guard;
+            if (iTerm < -guard) iTerm = -guard;
+            u = pTerm + iTerm + dTerm;
+        }
+    }
+    return u;
 }
 
 // --- MAX31865 deep debug read: proves the analog path ---
@@ -537,10 +550,8 @@ static void updateTempPID() {
     // Active target picks between brew and steam setpoints
     setTemp = steamFlag ? steamSetpoint : brewSetpoint;
 
-
-    heatPower = calcPID(pGainTemp, iGainTemp, dGainTemp,
-                        setTemp, currentTemp,
-                        dt, pvFiltTemp, iStateTemp, windupGuardTemp);
+    heatPower = calcPID(pGainTemp, iGainTemp, dGainTemp, setTemp, currentTemp, dt, pvFiltTemp,
+                        iStateTemp, windupGuardTemp);
 
     if (heatPower > 100.0f) heatPower = 100.0f;
     if (heatPower < 0.0f) heatPower = 0.0f;
@@ -1286,6 +1297,12 @@ void setup() {
     // 🔎 Confirm MAX31865 is present and healthy
     logMax31865Status();
 
+    // Initialize filtered PV & lastTemp to avoid first-step D kick
+    currentTemp = max31865.temperature(RNOMINAL, RREF);
+    if (currentTemp < 0) currentTemp = 0.0f;
+    pvFiltTemp = currentTemp;
+    lastTemp = currentTemp;
+
     // zero pressure
     float startP = analogRead(PRESS_PIN) * pressGrad + pressInt;
     if (startP > -PRESS_TOL && startP < PRESS_TOL) {
@@ -1349,13 +1366,10 @@ void loop() {
     // TRIAC control needs frequent checks (after OTA.handle to keep WiFi responsive)
     if (!otaActive) updateTriacControl();
 
-
-
     unsigned long publishInterval = shotFlag ? MQTT_SHOT_CYCLE : MQTT_IDLE_CYCLE;
     if (!otaActive && streamData && (currentTime - lastMqttTime) >= publishInterval) {
         if (mqttClient.connected()) publishStates();
         lastMqttTime = currentTime;
-
     }
 
     if (!otaActive && debugPrint &&
