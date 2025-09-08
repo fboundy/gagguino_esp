@@ -83,9 +83,9 @@ constexpr float WARMUP_CAP_PCT_DEFAULT = 100.0f;  // % (100 = no cap)
 constexpr float I_HOLDOFF_BAND_DEFAULT = 0.0f;    // °C (0 = no holdoff)
 
 // Smoothing for non-linear bits (neutralized)
-constexpr float I_HOLDOFF_HYST = 0.0f;    // °C
-constexpr float I_LEAK_FACTOR  = 1.0f;    // integrate at full rate
-constexpr float CAP_BLEND_EXTRA = 0.0f;   // °C
+constexpr float I_HOLDOFF_HYST = 0.0f;   // °C
+constexpr float I_LEAK_FACTOR = 1.0f;    // integrate at full rate
+constexpr float CAP_BLEND_EXTRA = 0.0f;  // °C
 
 constexpr float PRESS_TOL = 0.4f, PRESS_GRAD = 0.00903f, PRESS_INT_0 = -4.0f;
 constexpr int PRESS_BUFF_SIZE = 14;
@@ -199,8 +199,6 @@ char t_pidd_state[96], t_pidd_cmd[96];
 char t_pidg_state[96], t_pidg_cmd[96];
 // PID derivative filter tau topics
 char t_piddtau_state[96], t_piddtau_cmd[96];
-// Sensor “mirror” of setpoints for verification
-char t_brewset_sensor_state[96], t_steamset_sensor_state[96];
 
 // Config topics
 char c_shotvol[128], c_settemp[128], c_curtemp[128], c_press[128], c_shottime[128], c_ota[128];
@@ -209,7 +207,6 @@ char c_pidp_number[128], c_pidi_number[128], c_pidd_number[128], c_pidg_number[1
 char c_shot[128], c_preflow[128], c_steam[128];
 char c_brewset_number[128], c_steamset_number[128];
 char c_piddtau_number[128];  // PID D Tau (seconds)
-char c_brewset_sensor[128], c_steamset_sensor[128];
 // Switch config
 char c_heater[128];
 // TRIAC pump power number config
@@ -450,88 +447,6 @@ static float calcPID(float Kp, float Ki, float Kd, float sp, float pv,
         }
     }
     return u;
-}
-
-// --- MAX31865 deep debug read: proves the analog path ---
-/**
- * @brief Verbose one‑shot read of MAX31865 for debugging analog chain.
- */
-static void debugReadMAX31865() {
-    // Configure for your wiring (2/3/4 wire)
-    max31865.begin(MAX31865_2WIRE);
-    delay(5);
-
-    // Clear any latched faults, enable bias, take a one-shot
-    max31865.clearFault();
-    max31865.enableBias(true);
-    delay(10);  // bias settle
-    max31865.autoConvert(false);
-    delay(1);
-
-    uint16_t raw = max31865.readRTD();  // Library returns 15-bit value (D15..D1), LSB is fault
-    // Some forks return the unshifted word. Normalize defensively:
-    uint16_t rtd = (raw > 32768) ? (raw >> 1) : raw;
-
-    // Ratio is 15-bit / 32768.0
-    float ratio = (float)rtd / 32768.0f;
-    float R = ratio * RREF;
-
-    uint8_t f = max31865.readFault();
-    max31865.enableBias(false);
-
-    LOG("MAX31865: raw=0x%04X rtd=%u ratio=%.6f R=%.2f Ω", raw, rtd, ratio, R);
-
-    if (f) {
-        LOG("MAX31865: FAULT=0x%02X%s%s%s%s%s%s", f,
-            (f & MAX31865_FAULT_HIGHTHRESH) ? " HIGHTHRESH" : "",
-            (f & MAX31865_FAULT_LOWTHRESH) ? " LOWTHRESH" : "",
-            (f & MAX31865_FAULT_REFINLOW) ? " REFINLOW" : "",
-            (f & MAX31865_FAULT_REFINHIGH) ? " REFINHIGH" : "",
-            (f & MAX31865_FAULT_RTDINLOW) ? " RTDINLOW" : "",
-            (f & MAX31865_FAULT_OVUV) ? " OVC/UV" : "");
-        // Keep faults latched in logs; clear if you want to retry:
-        // max31865.clearFault();
-    }
-
-    // For extra confidence, also compute temperature:
-    float t = max31865.temperature(RNOMINAL, RREF);
-    LOG("MAX31865: Temp=%.2f °C (RNOM=%.1f, RREF=%.1f)", t, RNOMINAL, RREF);
-}
-
-// --- MAX31865 connectivity check & logging ---
-/**
- * @brief Check MAX31865 fault/status and log useful diagnostics.
- */
-static void logMax31865Status() {
-    uint8_t f = max31865.readFault();
-
-    // If the chip isn't on the bus, many MCUs will read 0xFF on MISO
-    if (f == 0xFF) {
-        LOG("MAX31865: no SPI response (CS=%d) — check wiring/power", MAX_CS);
-        return;
-    }
-
-    if (f) {
-        // Decode common fault bits for clarity
-        LOG("MAX31865: detected but reporting FAULT=0x%02X%s%s%s%s%s%s", f,
-            (f & MAX31865_FAULT_HIGHTHRESH) ? " HIGHTHRESH" : "",
-            (f & MAX31865_FAULT_LOWTHRESH) ? " LOWTHRESH" : "",
-            (f & MAX31865_FAULT_REFINLOW) ? " REFINLOW" : "",
-            (f & MAX31865_FAULT_REFINHIGH) ? " REFINHIGH" : "",
-            (f & MAX31865_FAULT_RTDINLOW) ? " RTDINLOW" : "",
-            (f & MAX31865_FAULT_OVUV) ? " OVC/UV" : "");
-        max31865.clearFault();
-    } else {
-        // Read raw ratio (0..1), calculate resistance, and temperature
-        uint16_t raw = max31865.readRTD();
-        uint16_t rtd = (raw > 32768) ? (raw >> 1) : raw;
-        float ratio = (float)rtd / 32768.0f;
-        float resistance = ratio * RREF;
-        float tempC = max31865.temperature(RNOMINAL, RREF);
-
-        LOG("MAX31865: connected; raw=0x%04X rtd=%u ratio=%.6f  R=%.2f Ω  Temp=%.2f °C", raw, rtd,
-            ratio, resistance, tempC);
-    }
 }
 
 // --------------- espresso logic ---------------
@@ -812,11 +727,6 @@ static void buildTopics() {
     snprintf(t_piddtau_cmd, sizeof(t_piddtau_cmd), "%s/%s/pid_d_tau/set", STATE_BASE, uid_suffix);
     snprintf(t_piddtau_state, sizeof(t_piddtau_state), "%s/%s/pid_d_tau/state", STATE_BASE,
              uid_suffix);
-    // sensor mirrors of setpoints
-    snprintf(t_brewset_sensor_state, sizeof(t_brewset_sensor_state), "%s/%s/brew_setpoint/state",
-             STATE_BASE, uid_suffix);
-    snprintf(t_steamset_sensor_state, sizeof(t_steamset_sensor_state), "%s/%s/steam_setpoint/state",
-             STATE_BASE, uid_suffix);
 
     // configs
     snprintf(c_shotvol, sizeof(c_shotvol), "%s/sensor/%s_shot_volume/config", DISCOVERY_PREFIX,
@@ -851,12 +761,6 @@ static void buildTopics() {
     snprintf(c_pidd_number, sizeof(c_pidd_number), "%s/number/%s_pid_d/config", DISCOVERY_PREFIX,
              dev_id);
     snprintf(c_pidg_number, sizeof(c_pidg_number), "%s/number/%s_pid_guard/config",
-             DISCOVERY_PREFIX, dev_id);
-
-    // sensor mirrors for setpoints
-    snprintf(c_brewset_sensor, sizeof(c_brewset_sensor), "%s/sensor/%s_brew_setpoint/config",
-             DISCOVERY_PREFIX, dev_id);
-    snprintf(c_steamset_sensor, sizeof(c_steamset_sensor), "%s/sensor/%s_steam_setpoint/config",
              DISCOVERY_PREFIX, dev_id);
     // diagnostic sensors
     snprintf(c_accnt, sizeof(c_accnt), "%s/sensor/%s_ac_count/config", DISCOVERY_PREFIX, dev_id);
@@ -1030,14 +934,15 @@ static void publishDiscovery() {
                         "}");
 
     // --- number: PID D Tau (seconds) ---
-    publishRetained(c_piddtau_number,
-                    String("{\"name\":\"PID D Tau\",\"uniq_id\":\"") + dev_id +
-                        "_pid_d_tau\",\"cmd_t\":\"" + t_piddtau_cmd + "\",\"stat_t\":\"" +
-                        t_piddtau_state +
-                        "\",\"unit_of_meas\":\"s\",\"min\":0.1,\"max\":5.0,\"step\":0.1,\"mode\":\"auto\",\"avty_t\":\"" +
-                        String(MQTT_STATUS) +
-                        "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"entity_category\":\"config\",\"dev\":" +
-                        dev + "}");
+    publishRetained(c_piddtau_number, String("{\"name\":\"PID D Tau\",\"uniq_id\":\"") + dev_id +
+                                          "_pid_d_tau\",\"cmd_t\":\"" + t_piddtau_cmd +
+                                          "\",\"stat_t\":\"" + t_piddtau_state +
+                                          "\",\"unit_of_meas\":\"s\",\"min\":0.1,\"max\":5.0,"
+                                          "\"step\":0.1,\"mode\":\"auto\",\"avty_t\":\"" +
+                                          String(MQTT_STATUS) +
+                                          "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\","
+                                          "\"entity_category\":\"config\",\"dev\":" +
+                                          dev + "}");
 
     // (warm-up cap and I holdoff numbers removed)
 
@@ -1070,25 +975,6 @@ static void publishDiscovery() {
             "\",\"min\":0,\"max\":20,\"step\":0.5,\"mode\":\"auto\",\"avty_t\":\"" +
             String(MQTT_STATUS) +
             "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}");
-
-    // --- sensor mirrors (read-only) for verification ---
-    publishRetained(c_brewset_sensor,
-                    String("{\"name\":\"Brew Setpoint (Sensor)\",\"uniq_id\":\"") + dev_id +
-                        "_brew_setpoint_sensor\",\"stat_t\":\"" + t_brewset_sensor_state +
-                        "\",\"dev_cla\":\"temperature\",\"unit_of_meas\":\"°C\",\"stat_cla\":"
-                        "\"measurement\",\"avty_t\":\"" +
-                        String(MQTT_STATUS) +
-                        "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev +
-                        "}");
-
-    publishRetained(c_steamset_sensor,
-                    String("{\"name\":\"Steam Setpoint (Sensor)\",\"uniq_id\":\"") + dev_id +
-                        "_steam_setpoint_sensor\",\"stat_t\":\"" + t_steamset_sensor_state +
-                        "\",\"dev_cla\":\"temperature\",\"unit_of_meas\":\"°C\",\"stat_cla\":"
-                        "\"measurement\",\"avty_t\":\"" +
-                        String(MQTT_STATUS) +
-                        "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev +
-                        "}");
 }
 
 // ---------- publishing states ----------
@@ -1144,10 +1030,6 @@ static void publishStates() {
     publishNum(t_pidd_state, dGainTemp, 2, true);
     publishNum(t_pidg_state, windupGuardTemp, 2, true);
     publishNum(t_piddtau_state, dTauTemp, 2, true);
-
-    // sensor mirrors (verification)
-    publishNum(t_brewset_sensor_state, brewSetpoint, 1);
-    publishNum(t_steamset_sensor_state, steamSetpoint, 1);
 }
 
 // ---------- MQTT callback (handle both setpoints) ----------
@@ -1245,9 +1127,6 @@ static void mqttCallback(char* topic, uint8_t* payload, unsigned int len) {
         // reflect new values
         publishNum(t_brewset_state, brewSetpoint, 1, true);
         publishNum(t_steamset_state, steamSetpoint, 1, true);
-        // sensors (verification)
-        publishNum(t_brewset_sensor_state, brewSetpoint, 1);
-        publishNum(t_steamset_sensor_state, steamSetpoint, 1);
     }
 }
 
@@ -1376,10 +1255,6 @@ void setup() {
     digitalWrite(HEAT_PIN, LOW);
     digitalWrite(TRIAC_PIN, LOW);
     heaterState = false;
-
-    debugReadMAX31865();
-    // 🔎 Confirm MAX31865 is present and healthy
-    logMax31865Status();
 
     // Initialize filtered PV & lastTemp to avoid first-step D kick
     currentTemp = max31865.temperature(RNOMINAL, RREF);
