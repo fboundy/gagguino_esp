@@ -1160,6 +1160,9 @@ void setup() {
     digitalWrite(HEAT_PIN, LOW);
     heaterState = false;
 
+    // Initialize MAX31865 (set wiring: 2/3/4-wire as appropriate)
+    max31865.begin(MAX31865_2WIRE);
+
     // Initialize filtered PV & lastTemp to avoid first-step D kick
     currentTemp = max31865.temperature(RNOMINAL, RREF);
     if (currentTemp < 0) currentTemp = 0.0f;
