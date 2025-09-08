@@ -15,3 +15,4 @@ const char* MQTT_PASS = "0pl,mko9";        // leave "" if not needed
 // ---- Topics ----
 const char* MQTT_TOPIC = "homeassistant/espresso/telemetry";  // telemetry JSON
 const char* MQTT_STATUS = "homeassistant/espresso/status";    // online/offline retained
+const char* MQTT_ERRORS = "homeassistant/espresso/error";      // significant error log
