@@ -52,8 +52,9 @@ constexpr int FLOW_PIN = 26, ZC_PIN = 25, HEAT_PIN = 27, AC_SENS = 14, TRIAC_PIN
 constexpr int MAX_CS = 16;
 constexpr int PRESS_PIN = 35;
 
-constexpr unsigned long PRESS_CYCLE = 100, PID_CYCLE = 500, PWM_CYCLE = 500, SER_OUT_CYCLE = 200,
-                        LOG_CYCLE = 2000;
+constexpr unsigned long PRESS_CYCLE = 100, PID_CYCLE = 500, PWM_CYCLE = 500, LOG_CYCLE = 2000;
+constexpr unsigned long MQTT_IDLE_CYCLE = 10000;  // ms between publishes when idle
+constexpr unsigned long MQTT_SHOT_CYCLE = 1000;   // ms between publishes during a shot
 
 // Brew & Steam setpoint limits
 constexpr float BREW_MIN = 90.0f, BREW_MAX = 99.0f;
@@ -124,7 +125,7 @@ float pressBuff[PRESS_BUFF_SIZE] = {0};
 uint8_t pressBuffIdx = 0;
 
 // Time/shot
-unsigned long nLoop = 0, currentTime = 0, lastPidTime = 0, lastPwmTime = 0, lastSerialTime = 0,
+unsigned long nLoop = 0, currentTime = 0, lastPidTime = 0, lastPwmTime = 0, lastMqttTime = 0,
               lastLogTime = 0;
 ;
 volatile unsigned long lastPulseTime = 0;
@@ -1299,9 +1300,10 @@ void loop() {
     // TRIAC control needs frequent checks (after OTA.handle to keep WiFi responsive)
     if (!otaActive) updateTriacControl();
 
-    if (!otaActive && streamData && (currentTime - lastSerialTime) > SER_OUT_CYCLE) {
+    unsigned long publishInterval = shotFlag ? MQTT_SHOT_CYCLE : MQTT_IDLE_CYCLE;
+    if (!otaActive && streamData && (currentTime - lastMqttTime) >= publishInterval) {
         if (mqttClient.connected()) publishStates();
-        lastSerialTime = currentTime;
+        lastMqttTime = currentTime;
     }
 
     if (!otaActive && debugPrint && (currentTime - lastLogTime) > LOG_CYCLE) { /* optional debug printing */
