@@ -29,6 +29,7 @@
 #include <esp_timer.h>
 
 #include <cstdarg>
+#include <map>
 
 #include "secrets.h"  // WIFI_*, MQTT_*
 
@@ -907,22 +908,42 @@ static void publishDiscovery() {
 }
 
 // ---------- publishing states ----------
+// Track last published values per topic to suppress duplicates
+static std::map<String, String> s_lastStr;
+static std::map<String, float> s_lastNum;
+static std::map<String, bool> s_lastBool;
+
+static void resetPublishCache() {
+    s_lastStr.clear();
+    s_lastNum.clear();
+    s_lastBool.clear();
+}
 /**
  * @brief Publish a string value to MQTT.
  */
 static void publishStr(const char* topic, const String& v, bool retain) {
+    auto it = s_lastStr.find(topic);
+    if (it != s_lastStr.end() && it->second == v) return;
+    s_lastStr[String(topic)] = v;
     if (!mqttClient.publish(topic, v.c_str(), retain))
         LOG_ERROR("MQTT: state publish failed (%s) val=%s", topic, v.c_str());
 }
 /**
  * @brief Publish a floating‑point value with fixed decimals.
  */
-static void publishNum(const char* topic, float v, uint8_t decimals = 1, bool retain = false) {
+static void publishNum(const char* topic, float v, uint8_t decimals = 1, bool retain = false,
+                       float threshold = 0.1f) {
+    auto it = s_lastNum.find(topic);
+    if (it != s_lastNum.end() && fabs(it->second - v) < threshold) return;
+    s_lastNum[String(topic)] = v;
     char tmp[24];
     dtostrf(v, 0, decimals, tmp);
     publishStr(topic, String(tmp), retain);
 }
 static void publishBool(const char* topic, bool on, bool retain = false) {
+    auto it = s_lastBool.find(topic);
+    if (it != s_lastBool.end() && it->second == on) return;
+    s_lastBool[String(topic)] = on;
     publishStr(topic, on ? "ON" : "OFF", retain);
 }
 
@@ -1161,6 +1182,7 @@ static void ensureMqtt() {
             mqttClient.subscribe(t_heater_cmd);
             // ✅ B) Immediately publish a full snapshot so HA has data right away
             // Do this only once, right after a successful (re)connect.
+            resetPublishCache();
             publishStates();
             publishNumberStatesSnapshot(); // include retained number/config states once
             // Reset cadence so the next periodic publish is spaced correctly.
