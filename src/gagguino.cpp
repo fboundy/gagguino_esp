@@ -64,6 +64,7 @@ constexpr unsigned long PRESS_CYCLE = 100, PID_CYCLE = 250, PWM_CYCLE = 250, LOG
 
 constexpr unsigned long IDLE_CYCLE = 5000;  // ms between publishes when idle (reduced chatter)
 constexpr unsigned long SHOT_CYCLE = 1000;  // ms between publishes during a shot
+constexpr unsigned long OTA_ENABLE_MS = 300000;  // ms OTA window after enabling
 
 // Brew & Steam setpoint limits
 constexpr float BREW_MIN = 90.0f, BREW_MAX = 99.0f;
@@ -174,6 +175,7 @@ bool shotFlag = false, preFlow = false, steamFlag = false, setupComplete = false
 // OTA
 static bool otaInitialized = false;
 static bool otaActive = false;  // minimize other work while OTA is in progress
+static unsigned long otaStart = 0;        // millis when OTA was enabled
 
 // MQTT diagnostics
 static IPAddress g_mqttIp;
@@ -190,6 +192,8 @@ char uid_suffix[16] = {0};
 // Sensor state topics
 char t_shotvol_state[96], t_settemp_state[96], t_curtemp_state[96], t_press_state[96],
     t_shottime_state[96], t_ota_state[96];
+// OTA command topic
+char t_ota_cmd[96];
 // Switch state/command topics
 char t_heater_state[96], t_heater_cmd[96];
 // Diagnostics state topics
@@ -311,6 +315,13 @@ static void publishStr(const char* topic, const String& v, bool retain = false);
  * - During OTA, the heater output is disabled and main work throttled.
  */
 static void ensureOta() {
+    if (otaActive && otaStart && (millis() - otaStart >= OTA_ENABLE_MS)) {
+        otaActive = false;
+        otaStart = 0;
+        publishStr(t_ota_state, "idle", true);
+        LOG("OTA: window expired");
+    }
+
     if (otaInitialized || WiFi.status() != WL_CONNECTED) return;
 
     // Derive a stable hostname from MAC
@@ -329,6 +340,8 @@ static void ensureOta() {
     ArduinoOTA.onStart([]() {
         LOG("OTA: Start (%s)", ArduinoOTA.getCommand() == U_FLASH ? "flash" : "fs");
         otaActive = true;  // signal loop to reduce load and suppress MQTT publishing
+        otaStart = millis();
+        publishStr(t_ota_state, "active", true);
         // Turn off heater to reduce power/noise during OTA
         digitalWrite(HEAT_PIN, LOW);
         heaterState = false;
@@ -336,6 +349,8 @@ static void ensureOta() {
     ArduinoOTA.onEnd([]() {
         LOG("OTA: End");
         otaActive = false;
+        otaStart = 0;
+        publishStr(t_ota_state, "idle", true);
         // (Optional) re-attach interrupts if you detached them on start
         // attachInterrupt(digitalPinToInterrupt(FLOW_PIN), flowInt, CHANGE);
         // attachInterrupt(digitalPinToInterrupt(ZC_PIN), zcInt, RISING);
@@ -370,6 +385,8 @@ static void ensureOta() {
         }
         LOG_ERROR("OTA: Error %d (%s)", (int)error, msg);
         otaActive = false;
+        otaStart = 0;
+        publishStr(t_ota_state, "error", true);
     });
 
     ArduinoOTA.begin();
@@ -619,6 +636,7 @@ static void buildTopics() {
     snprintf(t_shottime_state, sizeof(t_shottime_state), "%s/%s/shot_time/state", STATE_BASE,
              uid_suffix);
     snprintf(t_ota_state, sizeof(t_ota_state), "%s/%s/ota/status", STATE_BASE, uid_suffix);
+    snprintf(t_ota_cmd, sizeof(t_ota_cmd), "%s/%s/ota/enable", STATE_BASE, uid_suffix);
     // heater switch topics
     snprintf(t_heater_state, sizeof(t_heater_state), "%s/%s/heater/state", STATE_BASE, uid_suffix);
     snprintf(t_heater_cmd, sizeof(t_heater_cmd), "%s/%s/heater/set", STATE_BASE, uid_suffix);
@@ -1034,6 +1052,12 @@ static void mqttCallback(char* topic, uint8_t* payload, unsigned int len) {
         }
         publishBool(t_heater_state, heaterEnabled, true);
         LOG("HA: Heater -> %s", heaterEnabled ? "ON" : "OFF");
+    }
+    if (strcmp(topic, t_ota_cmd) == 0) {
+        otaActive = true;
+        otaStart = millis();
+        publishStr(t_ota_state, "enabled", true);
+        LOG("HA: OTA enabled for %lus", OTA_ENABLE_MS / 1000);
     }
     if (changed) {
         if (!steamFlag) setTemp = brewSetpoint;  // if brewing, apply immediately
