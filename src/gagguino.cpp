@@ -1044,11 +1044,15 @@ static void mqttCallback(char* topic, uint8_t* payload, unsigned int len) {
  * @brief Maintain Wi‑Fi connection with periodic reconnect attempts.
  */
 static void ensureWifi() {
+    static wl_status_t last = (wl_status_t)255;
+    static unsigned long lastTry = 0;
+    static bool connecting = false;
+    static unsigned long connectStart = 0;
+
     wl_status_t now = WiFi.status();
     if (now != WL_CONNECTED) {
         forceHeaterOff();
     }
-    static wl_status_t last = (wl_status_t)255;
     if (now != last) {
         if (now == WL_CONNECTED) {
             LOG("WiFi: %s  IP=%s  GW=%s  RSSI=%d dBm", wifiStatusName(now),
@@ -1061,12 +1065,32 @@ static void ensureWifi() {
         }
         last = now;
     }
-    if (now == WL_CONNECTED) return;
+    if (now == WL_CONNECTED) {
+        connecting = false;
+        return;
+    }
+
     // gentler reconnect policy: don't tear down; try reconnect every 10s
-    static unsigned long lastTry = 0;
-    if (millis() - lastTry < 10000) return;
-    lastTry = millis();
-    WiFi.reconnect();
+    if (!connecting && (millis() - lastTry) >= 10000) {
+        lastTry = millis();
+        WiFi.disconnect();
+        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+        connectStart = millis();
+        connecting = true;
+        return;
+    }
+
+    if (connecting) {
+        // Wait briefly for connection result while yielding to other tasks
+        wl_status_t res = WiFi.waitForConnectResult(100);
+        if (res == WL_CONNECTED) {
+            connecting = false;
+        } else if (millis() - connectStart > 10000) {
+            // Timed out, allow another attempt on next cycle
+            connecting = false;
+        }
+        delay(1);
+    }
 }
 
 /**
