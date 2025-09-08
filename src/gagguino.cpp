@@ -867,6 +867,15 @@ static void publishBool(const char* topic, bool on, bool retain = false) {
     publishStr(topic, on ? "ON" : "OFF", retain);
 }
 
+// Helper: immediately disable the heater output and prevent PID updates
+static void forceHeaterOff() {
+    heaterEnabled = false;
+    heatPower = 0.0f;
+    heatCycles = PWM_CYCLE;
+    digitalWrite(HEAT_PIN, LOW);
+    heaterState = false;
+}
+
 /**
  * @brief Publish periodic telemetry and mirrored setpoint values.
  */
@@ -975,10 +984,7 @@ static void mqttCallback(char* topic, uint8_t* payload, unsigned int len) {
     if (parse_onoff(t_heater_cmd, hv)) {
         heaterEnabled = hv;
         if (!heaterEnabled) {
-            heatPower = 0.0f;
-            heatCycles = PWM_CYCLE;
-            digitalWrite(HEAT_PIN, LOW);
-            heaterState = false;
+            forceHeaterOff();
         }
         publishBool(t_heater_state, heaterEnabled, true);
         LOG("HA: Heater -> %s", heaterEnabled ? "ON" : "OFF");
@@ -998,8 +1004,7 @@ static void mqttCallback(char* topic, uint8_t* payload, unsigned int len) {
 static void ensureWifi() {
     wl_status_t now = WiFi.status();
     if (now != WL_CONNECTED) {
-        digitalWrite(HEAT_PIN, LOW);
-        heaterState = false;
+        forceHeaterOff();
     }
     static wl_status_t last = (wl_status_t)255;
     if (now != last) {
@@ -1018,8 +1023,7 @@ static void ensureWifi() {
     static unsigned long t0 = 0;
     if (millis() - t0 < 2000) return;
     t0 = millis();
-    digitalWrite(HEAT_PIN, LOW);
-    heaterState = false;
+    forceHeaterOff();
     WiFi.disconnect(true);
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -1040,8 +1044,7 @@ static void ensureMqtt() {
     static bool lastConn = false;
     if (WiFi.status() != WL_CONNECTED) {
         lastConn = false;
-        digitalWrite(HEAT_PIN, LOW);
-        heaterState = false;
+        forceHeaterOff();
         return;
     }
     if (mqttClient.connected()) {
@@ -1074,8 +1077,7 @@ static void ensureMqtt() {
         return;
     }
     // Ensure heater is off while attempting MQTT reconnect
-    digitalWrite(HEAT_PIN, LOW);
-    heaterState = false;
+    forceHeaterOff();
     if (lastConn) {
         LOG("MQTT: disconnected (state=%d %s) — will retry", mqttClient.state(),
             mqttStateName(mqttClient.state()));
