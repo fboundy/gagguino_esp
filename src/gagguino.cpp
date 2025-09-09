@@ -31,9 +31,11 @@
 #include <math.h>
 
 #include <cstdarg>
+#include <string.h>
 #include <map>
 
 #include "secrets.h"  // WIFI_*, MQTT_*
+#include "espnow_packet.h"
 
 #define VERSION "7.0"
 #define STARTUP_WAIT 1000
@@ -63,7 +65,8 @@ constexpr int FLOW_PIN = 26, ZC_PIN = 25, HEAT_PIN = 27, AC_SENS = 14;
 constexpr int MAX_CS = 16;
 constexpr int PRESS_PIN = 35;
 
-constexpr unsigned long PRESS_CYCLE = 100, PID_CYCLE = 250, PWM_CYCLE = 250, LOG_CYCLE = 2000;
+constexpr unsigned long PRESS_CYCLE = 100, PID_CYCLE = 250, PWM_CYCLE = 250,
+                   ESP_CYCLE = 500, LOG_CYCLE = 2000;
 
 constexpr unsigned long IDLE_CYCLE = 5000;       // ms between publishes when idle (reduced chatter)
 constexpr unsigned long SHOT_CYCLE = 1000;       // ms between publishes during a shot
@@ -159,7 +162,7 @@ uint8_t pressBuffIdx = 0;
 
 // Time/shot
 unsigned long nLoop = 0, currentTime = 0, lastPidTime = 0, lastPwmTime = 0, lastMqttTime = 0,
-              lastLogTime = 0;
+              lastEspNowTime = 0, lastLogTime = 0;
 // microsecond timestamps for ISR debounce
 volatile int64_t lastPulseTime = 0;
 unsigned long shotStart = 0, startTime = 0;
@@ -1025,6 +1028,21 @@ static void publishStates() {
     publishNum(t_piddtau_state, dTauTemp, 2, true);
 }
 
+static void sendEspNowPacket() {
+    EspNowPacket pkt{};
+    pkt.shotFlag = shotFlag ? 1 : 0;
+    pkt.steamFlag = steamFlag ? 1 : 0;
+    pkt.heaterSwitch = heaterEnabled ? 1 : 0;
+    pkt.shotTimeMs = shotFlag ? static_cast<uint32_t>(currentTime - shotStart) : 0;
+    pkt.shotVolumeMl = static_cast<float>(shotVol);
+    pkt.setTempC = setTemp;
+    pkt.currentTempC = currentTemp;
+    pkt.pressureBar = pressNow;
+    pkt.steamSetpointC = steamSetpoint;
+    pkt.brewSetpointC = brewSetpoint;
+    esp_now_send(nullptr, reinterpret_cast<uint8_t*>(&pkt), sizeof(pkt));
+}
+
 // ---------- MQTT callback (handle both setpoints) ----------
 /**
  * @brief Handle inbound MQTT commands (setpoints, PID gains, heater switch).
@@ -1134,6 +1152,17 @@ static void initEspNow() {
     esp_now_deinit();
     if (esp_now_init() != ESP_OK) {
         LOG_ERROR("ESP-NOW: init failed");
+        g_espnowStatus = "error";
+        if (mqttClient.connected()) publishStr(t_espnow_state, g_espnowStatus, true);
+        return;
+    }
+    static const uint8_t broadcastAddr[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    esp_now_peer_info_t peerInfo{};
+    memcpy(peerInfo.peer_addr, broadcastAddr, 6);
+    peerInfo.channel = channel;
+    peerInfo.encrypt = false;
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+        LOG_ERROR("ESP-NOW: add peer failed");
         g_espnowStatus = "error";
         if (mqttClient.connected()) publishStr(t_espnow_state, g_espnowStatus, true);
         return;
@@ -1387,6 +1416,12 @@ void loop() {
 
     ensureWifi();
     ensureMqtt();
+
+    if (g_espnowStatus == "enabled" &&
+        (currentTime - lastEspNowTime) >= ESP_CYCLE) {
+        sendEspNowPacket();
+        lastEspNowTime = currentTime;
+    }
 
     unsigned long publishInterval = shotFlag ? SHOT_CYCLE : IDLE_CYCLE;
     if (!otaActive && streamData && (currentTime - lastMqttTime) >= publishInterval) {
